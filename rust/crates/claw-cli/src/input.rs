@@ -244,6 +244,14 @@ pub struct LineEditor {
     history: Vec<String>,
     yank_buffer: YankBuffer,
     vim_enabled: bool,
+    completion_state: Option<CompletionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionState {
+    prefix: String,
+    matches: Vec<String>,
+    next_index: usize,
 }
 
 impl LineEditor {
@@ -255,6 +263,7 @@ impl LineEditor {
             history: Vec::new(),
             yank_buffer: YankBuffer::default(),
             vim_enabled: false,
+            completion_state: None,
         }
     }
 
@@ -357,6 +366,10 @@ impl LineEditor {
     }
 
     fn handle_key_event(&mut self, session: &mut EditSession, key: KeyEvent) -> KeyAction {
+        if key.code != KeyCode::Tab {
+            self.completion_state = None;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') => {
@@ -673,22 +686,62 @@ impl LineEditor {
         session.cursor = insert_at + self.yank_buffer.text.len();
     }
 
-    fn complete_slash_command(&self, session: &mut EditSession) {
+    fn complete_slash_command(&mut self, session: &mut EditSession) {
         if session.mode == EditorMode::Command {
+            self.completion_state = None;
+            return;
+        }
+        if let Some(state) = self
+            .completion_state
+            .as_mut()
+            .filter(|_| session.cursor == session.text.len())
+            .filter(|state| {
+                state
+                    .matches
+                    .iter()
+                    .any(|candidate| candidate == &session.text)
+            })
+        {
+            let candidate = state.matches[state.next_index % state.matches.len()].clone();
+            state.next_index += 1;
+            session.text.replace_range(..session.cursor, &candidate);
+            session.cursor = candidate.len();
             return;
         }
         let Some(prefix) = slash_command_prefix(&session.text, session.cursor) else {
+            self.completion_state = None;
             return;
         };
-        let Some(candidate) = self
+        let matches = self
             .completions
             .iter()
-            .find(|candidate| candidate.starts_with(prefix) && candidate.as_str() != prefix)
-        else {
+            .filter(|candidate| candidate.starts_with(prefix) && candidate.as_str() != prefix)
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            self.completion_state = None;
             return;
+        }
+
+        let candidate = if let Some(state) = self
+            .completion_state
+            .as_mut()
+            .filter(|state| state.prefix == prefix && state.matches == matches)
+        {
+            let index = state.next_index % state.matches.len();
+            state.next_index += 1;
+            state.matches[index].clone()
+        } else {
+            let candidate = matches[0].clone();
+            self.completion_state = Some(CompletionState {
+                prefix: prefix.to_string(),
+                matches,
+                next_index: 1,
+            });
+            candidate
         };
 
-        session.text.replace_range(..session.cursor, candidate);
+        session.text.replace_range(..session.cursor, &candidate);
         session.cursor = candidate.len();
     }
 
@@ -1086,7 +1139,7 @@ mod tests {
     #[test]
     fn tab_completes_matching_slash_commands() {
         // given
-        let editor = LineEditor::new("> ", vec!["/help".to_string(), "/hello".to_string()]);
+        let mut editor = LineEditor::new("> ", vec!["/help".to_string(), "/hello".to_string()]);
         let mut session = EditSession::new(false);
         session.text = "/he".to_string();
         session.cursor = session.text.len();
@@ -1097,6 +1150,29 @@ mod tests {
         // then
         assert_eq!(session.text, "/help");
         assert_eq!(session.cursor, 5);
+    }
+
+    #[test]
+    fn tab_cycles_between_matching_slash_commands() {
+        // given
+        let mut editor = LineEditor::new(
+            "> ",
+            vec!["/permissions".to_string(), "/plugin".to_string()],
+        );
+        let mut session = EditSession::new(false);
+        session.text = "/p".to_string();
+        session.cursor = session.text.len();
+
+        // when
+        editor.complete_slash_command(&mut session);
+        let first = session.text.clone();
+        session.cursor = session.text.len();
+        editor.complete_slash_command(&mut session);
+        let second = session.text.clone();
+
+        // then
+        assert_eq!(first, "/permissions");
+        assert_eq!(second, "/plugin");
     }
 
     #[test]

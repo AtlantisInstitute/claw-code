@@ -40,12 +40,34 @@ impl CommandRegistry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommandCategory {
+    Core,
+    Workspace,
+    Session,
+    Git,
+    Automation,
+}
+
+impl SlashCommandCategory {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Core => "Core flow",
+            Self::Workspace => "Workspace & memory",
+            Self::Session => "Sessions & output",
+            Self::Git => "Git & GitHub",
+            Self::Automation => "Automation & discovery",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashCommandSpec {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub summary: &'static str,
     pub argument_hint: Option<&'static str>,
     pub resume_supported: bool,
+    pub category: SlashCommandCategory,
 }
 
 const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
@@ -55,6 +77,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show available slash commands",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Core,
     },
     SlashCommandSpec {
         name: "status",
@@ -62,6 +85,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show current session status",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Core,
     },
     SlashCommandSpec {
         name: "compact",
@@ -69,6 +93,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Compact local session history",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Core,
     },
     SlashCommandSpec {
         name: "model",
@@ -76,6 +101,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show or switch the active model",
         argument_hint: Some("[model]"),
         resume_supported: false,
+        category: SlashCommandCategory::Core,
     },
     SlashCommandSpec {
         name: "permissions",
@@ -83,6 +109,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show or switch the active permission mode",
         argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
         resume_supported: false,
+        category: SlashCommandCategory::Core,
     },
     SlashCommandSpec {
         name: "clear",
@@ -90,6 +117,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Start a fresh local session",
         argument_hint: Some("[--confirm]"),
         resume_supported: true,
+        category: SlashCommandCategory::Session,
     },
     SlashCommandSpec {
         name: "cost",
@@ -97,6 +125,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show cumulative token usage for this session",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Core,
     },
     SlashCommandSpec {
         name: "resume",
@@ -104,6 +133,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Load a saved session into the REPL",
         argument_hint: Some("<session-path>"),
         resume_supported: false,
+        category: SlashCommandCategory::Session,
     },
     SlashCommandSpec {
         name: "config",
@@ -111,6 +141,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Inspect Claw config files or merged sections",
         argument_hint: Some("[env|hooks|model|plugins]"),
         resume_supported: true,
+        category: SlashCommandCategory::Workspace,
     },
     SlashCommandSpec {
         name: "memory",
@@ -118,6 +149,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Inspect loaded Claw instruction memory files",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Workspace,
     },
     SlashCommandSpec {
         name: "init",
@@ -125,6 +157,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Create a starter CLAW.md for this repo",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Workspace,
     },
     SlashCommandSpec {
         name: "diff",
@@ -132,6 +165,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show git diff for current workspace changes",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Workspace,
     },
     SlashCommandSpec {
         name: "version",
@@ -139,6 +173,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show CLI version and build information",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Workspace,
     },
     SlashCommandSpec {
         name: "bughunter",
@@ -146,6 +181,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Inspect the codebase for likely bugs",
         argument_hint: Some("[scope]"),
         resume_supported: false,
+        category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
         name: "branch",
@@ -153,6 +189,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "List, create, or switch git branches",
         argument_hint: Some("[list|create <name>|switch <name>]"),
         resume_supported: false,
+        category: SlashCommandCategory::Git,
     },
     SlashCommandSpec {
         name: "worktree",
@@ -160,6 +197,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "List, add, remove, or prune git worktrees",
         argument_hint: Some("[list|add <path> [branch]|remove <path>|prune]"),
         resume_supported: false,
+        category: SlashCommandCategory::Git,
     },
     SlashCommandSpec {
         name: "commit",
@@ -167,6 +205,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Generate a commit message and create a git commit",
         argument_hint: None,
         resume_supported: false,
+        category: SlashCommandCategory::Git,
     },
     SlashCommandSpec {
         name: "commit-push-pr",
@@ -174,6 +213,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Commit workspace changes, push the branch, and open a PR",
         argument_hint: Some("[context]"),
         resume_supported: false,
+        category: SlashCommandCategory::Git,
     },
     SlashCommandSpec {
         name: "pr",
@@ -181,6 +221,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Draft or create a pull request from the conversation",
         argument_hint: Some("[context]"),
         resume_supported: false,
+        category: SlashCommandCategory::Git,
     },
     SlashCommandSpec {
         name: "issue",
@@ -188,6 +229,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Draft or create a GitHub issue from the conversation",
         argument_hint: Some("[context]"),
         resume_supported: false,
+        category: SlashCommandCategory::Git,
     },
     SlashCommandSpec {
         name: "ultraplan",
@@ -195,6 +237,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Run a deep planning prompt with multi-step reasoning",
         argument_hint: Some("[task]"),
         resume_supported: false,
+        category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
         name: "teleport",
@@ -202,6 +245,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Jump to a file or symbol by searching the workspace",
         argument_hint: Some("<symbol-or-path>"),
         resume_supported: false,
+        category: SlashCommandCategory::Workspace,
     },
     SlashCommandSpec {
         name: "debug-tool-call",
@@ -209,6 +253,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Replay the last tool call with debug details",
         argument_hint: None,
         resume_supported: false,
+        category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
         name: "export",
@@ -216,6 +261,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Export the current conversation to a file",
         argument_hint: Some("[file]"),
         resume_supported: true,
+        category: SlashCommandCategory::Session,
     },
     SlashCommandSpec {
         name: "session",
@@ -223,6 +269,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "List or switch managed local sessions",
         argument_hint: Some("[list|switch <session-id>]"),
         resume_supported: false,
+        category: SlashCommandCategory::Session,
     },
     SlashCommandSpec {
         name: "plugin",
@@ -232,6 +279,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
         resume_supported: false,
+        category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
         name: "agents",
@@ -239,6 +287,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "List configured agents",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Automation,
     },
     SlashCommandSpec {
         name: "skills",
@@ -246,6 +295,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "List available skills",
         argument_hint: None,
         resume_supported: true,
+        category: SlashCommandCategory::Automation,
     },
 ];
 
@@ -437,36 +487,129 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 pub fn render_slash_command_help() -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
-        "  [resume] means the command also works with --resume SESSION.json".to_string(),
+        "  Tab completes commands inside the REPL.".to_string(),
+        "  [resume] works with --resume SESSION.json.".to_string(),
     ];
-    for spec in slash_command_specs() {
-        let name = match spec.argument_hint {
-            Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
-            None => format!("/{}", spec.name),
-        };
-        let alias_suffix = if spec.aliases.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " (aliases: {})",
-                spec.aliases
-                    .iter()
-                    .map(|alias| format!("/{alias}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let resume = if spec.resume_supported {
-            " [resume]"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "  {name:<20} {}{alias_suffix}{resume}",
-            spec.summary
-        ));
+
+    for category in [
+        SlashCommandCategory::Core,
+        SlashCommandCategory::Workspace,
+        SlashCommandCategory::Session,
+        SlashCommandCategory::Git,
+        SlashCommandCategory::Automation,
+    ] {
+        lines.push(String::new());
+        lines.push(category.title().to_string());
+        lines.extend(
+            slash_command_specs()
+                .iter()
+                .filter(|spec| spec.category == category)
+                .map(render_slash_command_entry),
+        );
     }
+
     lines.join("\n")
+}
+
+fn render_slash_command_entry(spec: &SlashCommandSpec) -> String {
+    let alias_suffix = if spec.aliases.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (aliases: {})",
+            spec.aliases
+                .iter()
+                .map(|alias| format!("/{alias}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let resume = if spec.resume_supported {
+        " [resume]"
+    } else {
+        ""
+    };
+    format!(
+        "  {name:<46} {}{alias_suffix}{resume}",
+        spec.summary,
+        name = render_slash_command_name(spec),
+    )
+}
+
+fn render_slash_command_name(spec: &SlashCommandSpec) -> String {
+    match spec.argument_hint {
+        Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
+        None => format!("/{}", spec.name),
+    }
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    if left == right {
+        return 0;
+    }
+    if left.is_empty() {
+        return right.chars().count();
+    }
+    if right.is_empty() {
+        return left.chars().count();
+    }
+
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let cost = usize::from(left_char != *right_char);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right_chars.len()]
+}
+
+#[must_use]
+pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
+    let normalized = input.trim().trim_start_matches('/').to_ascii_lowercase();
+    if normalized.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut ranked = slash_command_specs()
+        .iter()
+        .filter_map(|spec| {
+            let score = std::iter::once(spec.name)
+                .chain(spec.aliases.iter().copied())
+                .map(str::to_ascii_lowercase)
+                .filter_map(|alias| {
+                    if alias == normalized {
+                        Some((0_usize, alias.len()))
+                    } else if alias.starts_with(&normalized) {
+                        Some((1, alias.len()))
+                    } else if alias.contains(&normalized) {
+                        Some((2, alias.len()))
+                    } else {
+                        let distance = levenshtein_distance(&alias, &normalized);
+                        (distance <= 2).then_some((3 + distance, alias.len()))
+                    }
+                })
+                .min();
+
+            score.map(|(bucket, len)| (bucket, len, render_slash_command_name(spec)))
+        })
+        .collect::<Vec<_>>();
+
+    ranked.sort_by(|left, right| left.cmp(right));
+    ranked.dedup_by(|left, right| left.2 == right.2);
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, display)| display)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1652,7 +1795,8 @@ mod tests {
         handle_worktree_slash_command, load_agents_from_roots, load_skills_from_roots,
         render_agents_report, render_plugins_report, render_skills_report,
         render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
-        CommitPushPrRequest, DefinitionSource, SkillOrigin, SkillRoot, SlashCommand,
+        suggest_slash_commands, CommitPushPrRequest, DefinitionSource, SkillOrigin, SkillRoot,
+        SlashCommand,
     };
     use plugins::{PluginKind, PluginManager, PluginManagerConfig, PluginMetadata, PluginSummary};
     use runtime::{CompactionConfig, ContentBlock, ConversationMessage, MessageRole, Session};
@@ -1965,6 +2109,11 @@ mod tests {
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
         assert!(help.contains("works with --resume SESSION.json"));
+        assert!(help.contains("Core flow"));
+        assert!(help.contains("Workspace & memory"));
+        assert!(help.contains("Sessions & output"));
+        assert!(help.contains("Git & GitHub"));
+        assert!(help.contains("Automation & discovery"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/compact"));
@@ -1998,6 +2147,13 @@ mod tests {
         assert!(help.contains("/skills"));
         assert_eq!(slash_command_specs().len(), 28);
         assert_eq!(resume_supported_slash_commands().len(), 13);
+    }
+
+    #[test]
+    fn suggests_close_slash_commands() {
+        let suggestions = suggest_slash_commands("stats", 3);
+        assert!(!suggestions.is_empty());
+        assert_eq!(suggestions[0], "/status");
     }
 
     #[test]

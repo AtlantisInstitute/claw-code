@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,14 +16,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, ClawApiClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    resolve_startup_auth_source, AuthSource, ClawApiClient, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
     handle_agents_slash_command, handle_plugins_slash_command, handle_skills_slash_command,
-    render_slash_command_help, resume_supported_slash_commands, slash_command_specs, SlashCommand,
+    render_slash_command_help, resume_supported_slash_commands, slash_command_specs,
+    suggest_slash_commands, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -59,13 +60,23 @@ type AllowedToolSet = BTreeSet<String>;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!(
-            "error: {error}
-
-Run `claw --help` for usage."
-        );
+        eprintln!("{}", render_cli_error(&error.to_string()));
         std::process::exit(1);
     }
+}
+
+fn render_cli_error(problem: &str) -> String {
+    let mut lines = vec!["Error".to_string()];
+    for (index, line) in problem.lines().enumerate() {
+        let label = if index == 0 {
+            "  Problem          "
+        } else {
+            "                   "
+        };
+        lines.push(format!("{label}{line}"));
+    }
+    lines.push("  Help             claw --help".to_string());
+    lines.join("\n")
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -321,15 +332,34 @@ fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
         Some(SlashCommand::Help) => Ok(CliAction::Help),
         Some(SlashCommand::Agents { args }) => Ok(CliAction::Agents { args }),
         Some(SlashCommand::Skills { args }) => Ok(CliAction::Skills { args }),
-        Some(command) => Err(format!(
-            "unsupported direct slash command outside the REPL: {command_name}",
-            command_name = match command {
+        Some(command) => Err(format_direct_slash_command_error(
+            match &command {
                 SlashCommand::Unknown(name) => format!("/{name}"),
                 _ => rest[0].clone(),
             }
+            .as_str(),
+            matches!(command, SlashCommand::Unknown(_)),
         )),
         None => Err(format!("unknown subcommand: {}", rest[0])),
     }
+}
+
+fn format_direct_slash_command_error(command: &str, is_unknown: bool) -> String {
+    let trimmed = command.trim().trim_start_matches('/');
+    let mut lines = vec![
+        "Direct slash command unavailable".to_string(),
+        format!("  Command          /{trimmed}"),
+    ];
+    if is_unknown {
+        append_slash_command_suggestions(&mut lines, trimmed);
+    } else {
+        lines.push("  Try              Start `claw` to use interactive slash commands".to_string());
+        lines.push(
+            "  Tip              Resume-safe commands also work with `claw --resume SESSION.json ...`"
+                .to_string(),
+        );
+    }
+    lines.join("\n")
 }
 
 fn resolve_model_alias(model: &str) -> &str {
@@ -670,13 +700,17 @@ struct StatusUsage {
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Model
-  Current model    {model}
-  Session messages {message_count}
-  Session turns    {turns}
+  Current          {model}
+  Session          {message_count} messages · {turns} turns
 
-Usage
-  Inspect current model with /model
-  Switch models with /model <name>"
+Aliases
+  opus             claude-opus-4-6
+  sonnet           claude-sonnet-4-6
+  haiku            claude-haiku-4-5-20251213
+
+Next
+  /model           Show the current model
+  /model <name>    Switch models for this REPL session"
     )
 }
 
@@ -685,7 +719,8 @@ fn format_model_switch_report(previous: &str, next: &str, message_count: usize) 
         "Model updated
   Previous         {previous}
   Current          {next}
-  Preserved msgs   {message_count}"
+  Preserved        {message_count} messages
+  Tip              Existing conversation context stayed attached"
     )
 }
 
@@ -718,28 +753,34 @@ fn format_permissions_report(mode: &str) -> String {
 ",
     );
 
+    let effect = match mode {
+        "read-only" => "Only read/search tools can run automatically",
+        "workspace-write" => "Editing tools can modify files in the workspace",
+        "danger-full-access" => "All tools can run without additional sandbox limits",
+        _ => "Unknown permission mode",
+    };
+
     format!(
         "Permissions
   Active mode      {mode}
-  Mode status      live session default
+  Effect           {effect}
 
 Modes
 {modes}
 
-Usage
-  Inspect current mode with /permissions
-  Switch modes with /permissions <mode>"
+Next
+  /permissions              Show the current mode
+  /permissions <mode>       Switch modes for subsequent tool calls"
     )
 }
 
 fn format_permissions_switch_report(previous: &str, next: &str) -> String {
     format!(
         "Permissions updated
-  Result           mode switched
   Previous mode    {previous}
   Active mode      {next}
-  Applies to       subsequent tool calls
-  Usage            /permissions to inspect current mode"
+  Applies to       Subsequent tool calls in this REPL
+  Tip              Run /permissions to review all available modes"
     )
 }
 
@@ -750,7 +791,11 @@ fn format_cost_report(usage: TokenUsage) -> String {
   Output tokens    {}
   Cache create     {}
   Cache read       {}
-  Total tokens     {}",
+  Total tokens     {}
+
+Next
+  /status          See session + workspace context
+  /compact         Trim local history if the session is getting large",
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_creation_input_tokens,
@@ -763,8 +808,8 @@ fn format_resume_report(session_path: &str, message_count: usize, turns: u32) ->
     format!(
         "Session resumed
   Session file     {session_path}
-  Messages         {message_count}
-  Turns            {turns}"
+  History          {message_count} messages · {turns} turns
+  Next             /status · /diff · /export"
     )
 }
 
@@ -773,7 +818,7 @@ fn format_compact_report(removed: usize, resulting_messages: usize, skipped: boo
         format!(
             "Compact
   Result           skipped
-  Reason           session below compaction threshold
+  Reason           Session is already below the compaction threshold
   Messages kept    {resulting_messages}"
         )
     } else {
@@ -781,7 +826,8 @@ fn format_compact_report(removed: usize, resulting_messages: usize, skipped: boo
             "Compact
   Result           compacted
   Messages removed {removed}
-  Messages kept    {resulting_messages}"
+  Messages kept    {resulting_messages}
+  Tip              Use /status to review the trimmed session"
         )
     }
 }
@@ -1052,28 +1098,65 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
-        let cwd = env::current_dir().map_or_else(
-            |_| "<unknown>".to_string(),
+        let color = io::stdout().is_terminal();
+        let cwd = env::current_dir().ok();
+        let cwd_display = cwd.as_ref().map_or_else(
+            || "<unknown>".to_string(),
             |path| path.display().to_string(),
         );
-        format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[2mShift+Enter\x1b[0m for newline",
-            self.model,
-            self.permission_mode.as_str(),
-            cwd,
-            self.session.id,
-        )
+        let workspace_name = cwd
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        let git_branch = status_context(Some(&self.session.path))
+            .ok()
+            .and_then(|context| context.git_branch);
+        let workspace_summary = git_branch.as_deref().map_or_else(
+            || workspace_name.to_string(),
+            |branch| format!("{workspace_name} · {branch}"),
+        );
+        let has_claw_md = cwd
+            .as_ref()
+            .is_some_and(|path| path.join("CLAW.md").is_file());
+        let mut lines = vec![
+            format!(
+                "{} {}",
+                if color {
+                    "\x1b[1;38;5;45m🦞 Claw Code\x1b[0m"
+                } else {
+                    "Claw Code"
+                },
+                if color {
+                    "\x1b[2m· ready\x1b[0m"
+                } else {
+                    "· ready"
+                }
+            ),
+            format!("  Workspace        {workspace_summary}"),
+            format!("  Directory        {cwd_display}"),
+            format!("  Model            {}", self.model),
+            format!("  Permissions      {}", self.permission_mode.as_str()),
+            format!("  Session          {}", self.session.id),
+            format!(
+                "  Quick start      {}",
+                if has_claw_md {
+                    "/help · /status · ask for a task"
+                } else {
+                    "/init · /help · /status"
+                }
+            ),
+            "  Editor           Tab completes slash commands · /vim toggles modal editing"
+                .to_string(),
+            "  Multiline        Shift+Enter or Ctrl+J inserts a newline".to_string(),
+        ];
+        if !has_claw_md {
+            lines.push(
+                "  First run        /init scaffolds CLAW.md, .claw.json, and local session files"
+                    .to_string(),
+            );
+        }
+        lines.join("\n")
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1246,19 +1329,28 @@ impl LiveCli {
                 false
             }
             SlashCommand::Branch { .. } => {
-                eprintln!("git branch commands not yet wired to REPL");
+                eprintln!(
+                    "{}",
+                    render_mode_unavailable("branch", "git branch commands")
+                );
                 false
             }
             SlashCommand::Worktree { .. } => {
-                eprintln!("git worktree commands not yet wired to REPL");
+                eprintln!(
+                    "{}",
+                    render_mode_unavailable("worktree", "git worktree commands")
+                );
                 false
             }
             SlashCommand::CommitPushPr { .. } => {
-                eprintln!("commit-push-pr not yet wired to REPL");
+                eprintln!(
+                    "{}",
+                    render_mode_unavailable("commit-push-pr", "commit + push + PR automation")
+                );
                 false
             }
             SlashCommand::Unknown(name) => {
-                eprintln!("unknown slash command: /{name}");
+                eprintln!("{}", render_unknown_slash_command(&name));
                 false
             }
         })
@@ -1837,6 +1929,20 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
     Ok(sessions)
 }
 
+fn format_relative_timestamp(epoch_secs: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(epoch_secs);
+    let elapsed = now.saturating_sub(epoch_secs);
+    match elapsed {
+        0..=59 => format!("{elapsed}s ago"),
+        60..=3_599 => format!("{}m ago", elapsed / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed / 3_600),
+        _ => format!("{}d ago", elapsed / 86_400),
+    }
+}
+
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
     let sessions = list_managed_sessions()?;
     let mut lines = vec![
@@ -1854,26 +1960,28 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
             "○ saved"
         };
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified} path={path}",
+            "  {id:<20} {marker:<10} {msgs:>3} msgs · updated {modified}",
             id = session.id,
             msgs = session.message_count,
-            modified = session.modified_epoch_secs,
-            path = session.path.display(),
+            modified = format_relative_timestamp(session.modified_epoch_secs),
         ));
+        lines.push(format!("    {}", session.path.display()));
     }
     Ok(lines.join("\n"))
 }
 
 fn render_repl_help() -> String {
     [
-        "REPL".to_string(),
-        "  /exit                Quit the REPL".to_string(),
-        "  /quit                Quit the REPL".to_string(),
-        "  /vim                 Toggle Vim keybindings".to_string(),
-        "  Up/Down              Navigate prompt history".to_string(),
-        "  Tab                  Complete slash commands".to_string(),
-        "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
-        "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
+        "Interactive REPL".to_string(),
+        "  Quick start          Ask a task in plain English or use one of the core commands below."
+            .to_string(),
+        "  Core commands        /help · /status · /model · /permissions · /compact".to_string(),
+        "  Exit                 /exit or /quit".to_string(),
+        "  Vim mode             /vim toggles modal editing".to_string(),
+        "  History              Up/Down recalls previous prompts".to_string(),
+        "  Completion           Tab cycles slash command matches".to_string(),
+        "  Cancel               Ctrl-C clears input (or exits on an empty prompt)".to_string(),
+        "  Multiline            Shift+Enter or Ctrl+J inserts a newline".to_string(),
         String::new(),
         render_slash_command_help(),
     ]
@@ -1881,6 +1989,41 @@ fn render_repl_help() -> String {
         "
 ",
     )
+}
+
+fn append_slash_command_suggestions(lines: &mut Vec<String>, name: &str) {
+    let suggestions = suggest_slash_commands(name, 3);
+    if suggestions.is_empty() {
+        lines.push("  Try              /help shows the full slash command map".to_string());
+        return;
+    }
+
+    lines.push("  Try              /help shows the full slash command map".to_string());
+    lines.push("Suggestions".to_string());
+    lines.extend(
+        suggestions
+            .into_iter()
+            .map(|suggestion| format!("  {suggestion}")),
+    );
+}
+
+fn render_unknown_slash_command(name: &str) -> String {
+    let mut lines = vec![
+        "Unknown slash command".to_string(),
+        format!("  Command          /{name}"),
+    ];
+    append_slash_command_suggestions(&mut lines, name);
+    lines.join("\n")
+}
+
+fn render_mode_unavailable(command: &str, label: &str) -> String {
+    [
+        "Command unavailable in this REPL mode".to_string(),
+        format!("  Command          /{command}"),
+        format!("  Feature          {label}"),
+        "  Tip              Use /help to find currently wired REPL commands".to_string(),
+    ]
+    .join("\n")
 }
 
 fn status_context(
@@ -1912,33 +2055,41 @@ fn format_status_report(
 ) -> String {
     [
         format!(
-            "Status
+            "Session
   Model            {model}
-  Permission mode  {permission_mode}
-  Messages         {}
-  Turns            {}
-  Estimated tokens {}",
-            usage.message_count, usage.turns, usage.estimated_tokens,
-        ),
-        format!(
-            "Usage
-  Latest total     {}
-  Cumulative input {}
-  Cumulative output {}
-  Cumulative total {}",
+  Permissions      {permission_mode}
+  Activity         {} messages · {} turns
+  Tokens           est {} · latest {} · total {}",
+            usage.message_count,
+            usage.turns,
+            usage.estimated_tokens,
             usage.latest.total_tokens(),
-            usage.cumulative.input_tokens,
-            usage.cumulative.output_tokens,
             usage.cumulative.total_tokens(),
         ),
         format!(
+            "Usage
+  Cumulative input {}
+  Cumulative output {}
+  Cache create     {}
+  Cache read       {}",
+            usage.cumulative.input_tokens,
+            usage.cumulative.output_tokens,
+            usage.cumulative.cache_creation_input_tokens,
+            usage.cumulative.cache_read_input_tokens,
+        ),
+        format!(
             "Workspace
-  Cwd              {}
+  Folder           {}
   Project root     {}
   Git branch       {}
-  Session          {}
+  Session file     {}
   Config files     loaded {}/{}
-  Memory files     {}",
+  Memory files     {}
+
+Next
+  /help            Browse commands
+  /session list    Inspect saved sessions
+  /diff            Review current workspace changes",
             context.cwd.display(),
             context
                 .project_root
@@ -2053,8 +2204,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     if project_context.instruction_files.is_empty() {
         lines.push("Discovered files".to_string());
         lines.push(
-            "  No CLAW instruction files discovered in the current directory ancestry."
-                .to_string(),
+            "  No CLAW instruction files discovered in the current directory ancestry.".to_string(),
         );
     } else {
         lines.push("Discovered files".to_string());
@@ -2321,7 +2471,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}\n\nSupport\n  Help             claw --help\n  REPL             /help"
     )
 }
 
@@ -2806,7 +2956,8 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
-) -> Result<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>> {
+) -> Result<ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
+{
     let (feature_config, tool_registry) = build_runtime_plugin_state()?;
     Ok(ConversationRuntime::new_with_features(
         session,
@@ -3730,65 +3881,118 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 }
 
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claw v{VERSION}")?;
+    writeln!(out, "Claw Code CLI v{VERSION}")?;
+    writeln!(
+        out,
+        "  Interactive coding assistant for the current workspace."
+    )?;
     writeln!(out)?;
-    writeln!(out, "Usage:")?;
+    writeln!(out, "Quick start")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
-    )?;
-    writeln!(out, "      Start the interactive REPL")?;
-    writeln!(
-        out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
-    )?;
-    writeln!(out, "      Send one prompt and exit")?;
-    writeln!(
-        out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
-    )?;
-    writeln!(out, "      Shorthand non-interactive prompt mode")?;
-    writeln!(
-        out,
-        "  claw --resume SESSION.json [/status] [/compact] [...]"
+        "  claw                                  Start the interactive REPL"
     )?;
     writeln!(
         out,
-        "      Inspect or maintain a saved session without entering the REPL"
+        "  claw \"summarize this repo\"            Run one prompt and exit"
     )?;
-    writeln!(out, "  claw dump-manifests")?;
-    writeln!(out, "  claw bootstrap-plan")?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw skills")?;
+    writeln!(
+        out,
+        "  claw prompt \"explain src/main.rs\"     Explicit one-shot prompt"
+    )?;
+    writeln!(
+        out,
+        "  claw --resume SESSION.json /status    Inspect a saved session"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Interactive essentials")?;
+    writeln!(
+        out,
+        "  /help                                 Browse the full slash command map"
+    )?;
+    writeln!(
+        out,
+        "  /status                               Inspect session + workspace state"
+    )?;
+    writeln!(
+        out,
+        "  /model <name>                         Switch models mid-session"
+    )?;
+    writeln!(
+        out,
+        "  /permissions <mode>                   Adjust tool access"
+    )?;
+    writeln!(
+        out,
+        "  Tab                                   Complete slash commands"
+    )?;
+    writeln!(
+        out,
+        "  /vim                                  Toggle modal editing"
+    )?;
+    writeln!(
+        out,
+        "  Shift+Enter / Ctrl+J                  Insert a newline"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Commands")?;
+    writeln!(
+        out,
+        "  claw dump-manifests                   Read upstream TS sources and print extracted counts"
+    )?;
+    writeln!(
+        out,
+        "  claw bootstrap-plan                   Print the bootstrap phase skeleton"
+    )?;
+    writeln!(
+        out,
+        "  claw agents                           List configured agents"
+    )?;
+    writeln!(
+        out,
+        "  claw skills                           List installed skills"
+    )?;
     writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  claw login")?;
-    writeln!(out, "  claw logout")?;
-    writeln!(out, "  claw init")?;
-    writeln!(out)?;
-    writeln!(out, "Flags:")?;
     writeln!(
         out,
-        "  --model MODEL              Override the active model"
+        "  claw login                            Start the OAuth login flow"
     )?;
     writeln!(
         out,
-        "  --output-format FORMAT     Non-interactive output format: text or json"
+        "  claw logout                           Clear saved OAuth credentials"
     )?;
     writeln!(
         out,
-        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
-    )?;
-    writeln!(
-        out,
-        "  --dangerously-skip-permissions  Skip all permission checks"
-    )?;
-    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
-    writeln!(
-        out,
-        "  --version, -V              Print version and build information locally"
+        "  claw init                             Scaffold CLAW.md + local files"
     )?;
     writeln!(out)?;
-    writeln!(out, "Interactive slash commands:")?;
+    writeln!(out, "Flags")?;
+    writeln!(
+        out,
+        "  --model MODEL                         Override the active model"
+    )?;
+    writeln!(
+        out,
+        "  --output-format FORMAT                Non-interactive output: text or json"
+    )?;
+    writeln!(
+        out,
+        "  --permission-mode MODE                Set read-only, workspace-write, or danger-full-access"
+    )?;
+    writeln!(
+        out,
+        "  --dangerously-skip-permissions        Skip all permission checks"
+    )?;
+    writeln!(
+        out,
+        "  --allowedTools TOOLS                  Restrict enabled tools (repeatable; comma-separated aliases supported)"
+    )?;
+    writeln!(
+        out,
+        "  --version, -V                         Print version and build information"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Slash command reference")?;
     writeln!(out, "{}", render_slash_command_help())?;
     writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
@@ -3800,7 +4004,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(out, "Resume-safe commands: {resume_commands}")?;
-    writeln!(out, "Examples:")?;
+    writeln!(out, "Examples")?;
     writeln!(out, "  claw --model opus \"summarize this repo\"")?;
     writeln!(
         out,
@@ -4072,7 +4276,8 @@ mod tests {
         );
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
-        assert!(error.contains("unsupported direct slash command"));
+        assert!(error.contains("Direct slash command unavailable"));
+        assert!(error.contains("/status"));
     }
 
     #[test]
@@ -4149,13 +4354,14 @@ mod tests {
     fn shared_help_uses_resume_annotation_copy() {
         let help = commands::render_slash_command_help();
         assert!(help.contains("Slash commands"));
+        assert!(help.contains("Tab completes commands inside the REPL."));
         assert!(help.contains("works with --resume SESSION.json"));
     }
 
     #[test]
     fn repl_help_includes_shared_commands_and_exit() {
         let help = render_repl_help();
-        assert!(help.contains("REPL"));
+        assert!(help.contains("Interactive REPL"));
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/model [model]"));
@@ -4177,6 +4383,7 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
+        assert!(help.contains("Tab cycles slash command matches"));
     }
 
     #[test]
@@ -4199,8 +4406,8 @@ mod tests {
         let report = format_resume_report("session.json", 14, 6);
         assert!(report.contains("Session resumed"));
         assert!(report.contains("Session file     session.json"));
-        assert!(report.contains("Messages         14"));
-        assert!(report.contains("Turns            6"));
+        assert!(report.contains("History          14 messages · 6 turns"));
+        assert!(report.contains("/status · /diff · /export"));
     }
 
     #[test]
@@ -4209,6 +4416,7 @@ mod tests {
         assert!(compacted.contains("Compact"));
         assert!(compacted.contains("Result           compacted"));
         assert!(compacted.contains("Messages removed 8"));
+        assert!(compacted.contains("Use /status"));
         let skipped = format_compact_report(0, 3, true);
         assert!(skipped.contains("Result           skipped"));
     }
@@ -4227,6 +4435,7 @@ mod tests {
         assert!(report.contains("Cache create     3"));
         assert!(report.contains("Cache read       1"));
         assert!(report.contains("Total tokens     32"));
+        assert!(report.contains("/compact"));
     }
 
     #[test]
@@ -4234,6 +4443,7 @@ mod tests {
         let report = format_permissions_report("workspace-write");
         assert!(report.contains("Permissions"));
         assert!(report.contains("Active mode      workspace-write"));
+        assert!(report.contains("Effect           Editing tools can modify files in the workspace"));
         assert!(report.contains("Modes"));
         assert!(report.contains("read-only          ○ available Read/search tools only"));
         assert!(report.contains("workspace-write    ● current   Edit files inside the workspace"));
@@ -4244,10 +4454,9 @@ mod tests {
     fn permissions_switch_report_is_structured() {
         let report = format_permissions_switch_report("read-only", "workspace-write");
         assert!(report.contains("Permissions updated"));
-        assert!(report.contains("Result           mode switched"));
         assert!(report.contains("Previous mode    read-only"));
         assert!(report.contains("Active mode      workspace-write"));
-        assert!(report.contains("Applies to       subsequent tool calls"));
+        assert!(report.contains("Applies to       Subsequent tool calls in this REPL"));
     }
 
     #[test]
@@ -4265,9 +4474,10 @@ mod tests {
     fn model_report_uses_sectioned_layout() {
         let report = format_model_report("sonnet", 12, 4);
         assert!(report.contains("Model"));
-        assert!(report.contains("Current model    sonnet"));
-        assert!(report.contains("Session messages 12"));
-        assert!(report.contains("Switch models with /model <name>"));
+        assert!(report.contains("Current          sonnet"));
+        assert!(report.contains("Session          12 messages · 4 turns"));
+        assert!(report.contains("Aliases"));
+        assert!(report.contains("/model <name>    Switch models for this REPL session"));
     }
 
     #[test]
@@ -4276,7 +4486,7 @@ mod tests {
         assert!(report.contains("Model updated"));
         assert!(report.contains("Previous         sonnet"));
         assert!(report.contains("Current          opus"));
-        assert!(report.contains("Preserved msgs   9"));
+        assert!(report.contains("Preserved        9 messages"));
     }
 
     #[test]
@@ -4311,18 +4521,18 @@ mod tests {
                 git_branch: Some("main".to_string()),
             },
         );
-        assert!(status.contains("Status"));
+        assert!(status.contains("Session"));
         assert!(status.contains("Model            sonnet"));
-        assert!(status.contains("Permission mode  workspace-write"));
-        assert!(status.contains("Messages         7"));
-        assert!(status.contains("Latest total     10"));
-        assert!(status.contains("Cumulative total 31"));
-        assert!(status.contains("Cwd              /tmp/project"));
+        assert!(status.contains("Permissions      workspace-write"));
+        assert!(status.contains("Activity         7 messages · 3 turns"));
+        assert!(status.contains("Tokens           est 128 · latest 10 · total 31"));
+        assert!(status.contains("Folder           /tmp/project"));
         assert!(status.contains("Project root     /tmp"));
         assert!(status.contains("Git branch       main"));
-        assert!(status.contains("Session          session.json"));
+        assert!(status.contains("Session file     session.json"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
+        assert!(status.contains("/session list"));
     }
 
     #[test]
@@ -4458,8 +4668,8 @@ mod tests {
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));
-        assert!(help.contains("Tab"));
-        assert!(help.contains("Shift+Enter/Ctrl+J"));
+        assert!(help.contains("Tab cycles"));
+        assert!(help.contains("Shift+Enter or Ctrl+J"));
     }
 
     #[test]
