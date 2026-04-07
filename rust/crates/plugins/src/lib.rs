@@ -820,6 +820,25 @@ impl PluginRegistry {
         Ok(tools)
     }
 
+    /// Returns `(plugin_name, commands_dir)` pairs for enabled plugins that have
+    /// a `commands/` directory in their root. These can be surfaced as skill roots
+    /// so that plugin markdown commands are discoverable as slash commands using
+    /// the `plugin-name:command-name` namespace.
+    #[must_use]
+    pub fn plugin_command_roots(&self) -> Vec<(String, PathBuf)> {
+        self.plugins
+            .iter()
+            .filter(|plugin| plugin.is_enabled())
+            .filter_map(|plugin| {
+                let root = plugin.metadata().root.as_ref()?;
+                let commands_dir = root.join("commands");
+                commands_dir
+                    .is_dir()
+                    .then(|| (plugin.metadata().name.clone(), commands_dir))
+            })
+            .collect()
+    }
+
     pub fn initialize(&self) -> Result<(), PluginError> {
         for plugin in self.plugins.iter().filter(|plugin| plugin.is_enabled()) {
             plugin.validate()?;
@@ -849,6 +868,10 @@ pub struct PluginManagerConfig {
     pub install_root: Option<PathBuf>,
     pub registry_path: Option<PathBuf>,
     pub bundled_root: Option<PathBuf>,
+    /// Optional path to a Claude Code-compatible plugin cache directory.
+    /// Defaults to `<config_home>/plugins/cache` if not set.
+    /// Structure: `<cache_root>/<marketplace>/<name>/<version>/`.
+    pub cache_root: Option<PathBuf>,
 }
 
 impl PluginManagerConfig {
@@ -861,6 +884,7 @@ impl PluginManagerConfig {
             install_root: None,
             registry_path: None,
             bundled_root: None,
+            cache_root: None,
         }
     }
 }
@@ -1047,6 +1071,16 @@ impl PluginManager {
             .unwrap_or_else(|| self.config.config_home.join("plugins").join("installed"))
     }
 
+    /// Returns the Claude Code-compatible plugin cache root.
+    /// Default: `<config_home>/plugins/cache`.
+    #[must_use]
+    pub fn cache_root(&self) -> PathBuf {
+        self.config
+            .cache_root
+            .clone()
+            .unwrap_or_else(|| self.config.config_home.join("plugins").join("cache"))
+    }
+
     #[must_use]
     pub fn registry_path(&self) -> PathBuf {
         self.config.registry_path.clone().unwrap_or_else(|| {
@@ -1074,6 +1108,9 @@ impl PluginManager {
 
         let installed = self.discover_installed_plugins_with_failures()?;
         discovery.extend(installed);
+
+        let cached = self.discover_cached_plugins_with_failures(&discovery.plugins)?;
+        discovery.extend(cached);
 
         let external =
             self.discover_external_directory_plugins_with_failures(&discovery.plugins)?;
@@ -1348,6 +1385,83 @@ impl PluginManager {
         Ok(discovery)
     }
 
+    /// Discovers plugins from the Claude Code-compatible cache directory.
+    /// Cache structure: `<cache_root>/<marketplace>/<name>/<version>/`.
+    fn discover_cached_plugins_with_failures(
+        &self,
+        existing_plugins: &[PluginDefinition],
+    ) -> Result<PluginDiscovery, PluginError> {
+        let mut discovery = PluginDiscovery::default();
+        let cache_root = self.cache_root();
+
+        let marketplace_dirs = match fs::read_dir(&cache_root) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(discovery),
+            Err(error) => return Err(PluginError::Io(error)),
+        };
+
+        for marketplace_dir in marketplace_dirs {
+            let marketplace = marketplace_dir
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().to_string());
+
+            let name_dirs = match fs::read_dir(&marketplace_dir) {
+                Ok(entries) => entries
+                    .filter_map(|entry| entry.ok().map(|e| e.path()))
+                    .filter(|p| p.is_dir())
+                    .collect::<Vec<_>>(),
+                Err(_) => continue,
+            };
+
+            for name_dir in name_dirs {
+                let version_dirs = match fs::read_dir(&name_dir) {
+                    Ok(entries) => entries
+                        .filter_map(|entry| entry.ok().map(|e| e.path()))
+                        .filter(|p| p.is_dir())
+                        .collect::<Vec<_>>(),
+                    Err(_) => continue,
+                };
+
+                for version_dir in version_dirs {
+                    if plugin_manifest_path(&version_dir).is_err() {
+                        continue;
+                    }
+
+                    let source = version_dir.display().to_string();
+                    match load_plugin_definition(
+                        &version_dir,
+                        PluginKind::External,
+                        source.clone(),
+                        &marketplace,
+                    ) {
+                        Ok(plugin) => {
+                            if existing_plugins
+                                .iter()
+                                .chain(discovery.plugins.iter())
+                                .all(|existing| existing.metadata().id != plugin.metadata().id)
+                            {
+                                discovery.push_plugin(plugin);
+                            }
+                        }
+                        Err(error) => {
+                            discovery.push_failure(PluginLoadFailure::new(
+                                version_dir,
+                                PluginKind::External,
+                                source,
+                                error,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(discovery)
+    }
+
     pub fn installed_plugin_registry_report(&self) -> Result<PluginRegistryReport, PluginError> {
         self.sync_bundled_plugins()?;
         Ok(self.build_registry_report(self.discover_installed_plugins_with_failures()?))
@@ -1442,10 +1556,36 @@ impl PluginManager {
             .enabled_plugins
             .get(&metadata.id)
             .copied()
-            .unwrap_or(match metadata.kind {
-                PluginKind::External => false,
-                PluginKind::Builtin | PluginKind::Bundled => metadata.default_enabled,
+            .unwrap_or_else(|| {
+                // Check the Claude Code installed_plugins.json registry.
+                // Any plugin listed there was explicitly installed and should be
+                // enabled by default unless overridden in enabledPlugins.
+                if self.is_in_claude_code_registry(&metadata.id) {
+                    return true;
+                }
+                match metadata.kind {
+                    PluginKind::External => false,
+                    PluginKind::Builtin | PluginKind::Bundled => metadata.default_enabled,
+                }
             })
+    }
+
+    /// Checks if a `plugin_id` appears in the Claude Code `installed_plugins.json`.
+    fn is_in_claude_code_registry(&self, plugin_id: &str) -> bool {
+        let registry_path = self
+            .config
+            .config_home
+            .join("plugins")
+            .join("installed_plugins.json");
+        let Ok(contents) = fs::read_to_string(&registry_path) else {
+            return false;
+        };
+        let Ok(root) = serde_json::from_str::<Value>(&contents) else {
+            return false;
+        };
+        root.get("plugins")
+            .and_then(Value::as_object)
+            .is_some_and(|plugins| plugins.contains_key(plugin_id))
     }
 
     fn ensure_known_plugin(&self, plugin_id: &str) -> Result<(), PluginError> {
@@ -1619,15 +1759,15 @@ fn detect_claude_code_manifest_contract_gaps(
     for (field, detail) in [
         (
             "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.claw/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
+            "plugin manifest field `skills` uses the Claude Code plugin contract; `claude` does not load plugin-managed skills and instead discovers skills from local roots such as `.claude/skills`, `.omc/skills`, `.agents/skills`, `~/.omc/skills`, and `~/.claude/skills/omc-learned`.",
         ),
         (
             "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
+            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claude` does not import MCP servers from plugin manifests.",
         ),
         (
             "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
+            "plugin manifest field `agents` uses the Claude Code plugin contract; `claude` does not load plugin-managed agent markdown catalogs from plugin manifests.",
         ),
     ] {
         if root.contains_key(field) {
@@ -1643,7 +1783,7 @@ fn detect_claude_code_manifest_contract_gaps(
         .is_some_and(|commands| commands.iter().any(Value::is_string))
     {
         errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
+            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claude` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
         });
     }
 
@@ -1655,7 +1795,7 @@ fn detect_claude_code_manifest_contract_gaps(
             ) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claude` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
                     ),
                 });
             }

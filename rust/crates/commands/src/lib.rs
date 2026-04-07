@@ -228,7 +228,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "plugin",
         aliases: &["plugins", "marketplace"],
-        summary: "Manage Claw Code plugins",
+        summary: "Manage Claude Code plugins",
         argument_hint: Some(
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
         ),
@@ -1963,6 +1963,7 @@ enum DefinitionSource {
     UserClaw,
     UserCodex,
     UserClaude,
+    Plugin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1970,6 +1971,7 @@ enum DefinitionScope {
     Project,
     UserConfigHome,
     UserHome,
+    Plugin,
 }
 
 impl DefinitionScope {
@@ -1978,6 +1980,7 @@ impl DefinitionScope {
             Self::Project => "Project roots",
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
+            Self::Plugin => "Plugin roots",
         }
     }
 }
@@ -1990,6 +1993,7 @@ impl DefinitionSource {
             }
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
+            Self::Plugin => DefinitionScope::Plugin,
         }
     }
 
@@ -2017,17 +2021,23 @@ struct SkillSummary {
     origin: SkillOrigin,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SkillOrigin {
     SkillsDir,
     LegacyCommandsDir,
+    /// Commands from a named plugin. Skill names are prefixed with
+    /// `<plugin_name>:` to form the `plugin-name:command-name` namespace.
+    PluginCommands {
+        plugin_name: String,
+    },
 }
 
 impl SkillOrigin {
-    fn detail_label(self) -> Option<&'static str> {
+    fn detail_label(&self) -> Option<&str> {
         match self {
             Self::SkillsDir => None,
             Self::LegacyCommandsDir => Some("legacy /commands"),
+            Self::PluginCommands { plugin_name } => Some(plugin_name.as_str()),
         }
     }
 }
@@ -2314,8 +2324,7 @@ pub fn resolve_skill_invocation(
             .unwrap_or_default();
         if !skill_token.is_empty() {
             if let Err(error) = resolve_skill_path(cwd, skill_token) {
-                let mut message =
-                    format!("Unknown skill: {skill_token} ({error})");
+                let mut message = format!("Unknown skill: {skill_token} ({error})");
                 let roots = discover_skill_roots(cwd);
                 if let Ok(available) = load_skills_from_roots(&roots) {
                     let names: Vec<String> = available
@@ -2324,15 +2333,10 @@ pub fn resolve_skill_invocation(
                         .map(|s| s.name.clone())
                         .collect();
                     if !names.is_empty() {
-                        message.push_str(&format!(
-                            "\n  Available skills: {}",
-                            names.join(", ")
-                        ));
+                        message.push_str(&format!("\n  Available skills: {}", names.join(", ")));
                     }
                 }
-                message.push_str(
-                    "\n  Usage: /skills [list|install <path>|help|<skill> [args]]",
-                );
+                message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
                 return Err(message);
             }
         }
@@ -2354,7 +2358,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
         let mut entries = Vec::new();
         for entry in fs::read_dir(&root.path)? {
             let entry = entry?;
-            match root.origin {
+            match &root.origin {
                 SkillOrigin::SkillsDir => {
                     if !entry.path().is_dir() {
                         continue;
@@ -2394,6 +2398,23 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
                     );
                     let (name, _) = parse_skill_frontmatter(&contents);
                     entries.push((name.unwrap_or(fallback_name), markdown_path));
+                }
+                SkillOrigin::PluginCommands { plugin_name } => {
+                    let path = entry.path();
+                    if !path
+                        .extension()
+                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+                    {
+                        continue;
+                    }
+                    let contents = fs::read_to_string(&path)?;
+                    let fallback_name = path.file_stem().map_or_else(
+                        || entry.file_name().to_string_lossy().to_string(),
+                        |stem| stem.to_string_lossy().to_string(),
+                    );
+                    let (name, _) = parse_skill_frontmatter(&contents);
+                    let command_name = name.unwrap_or(fallback_name);
+                    entries.push((format!("{plugin_name}:{command_name}"), path));
                 }
             }
         }
@@ -2561,7 +2582,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         push_unique_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
-            ancestor.join(".claw").join(leaf),
+            ancestor.join(".claude").join(leaf),
         );
         push_unique_root(
             &mut roots,
@@ -2575,7 +2596,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+    if let Ok(claw_config_home) = env::var("CLAUDE_CONFIG_HOME") {
         push_unique_root(
             &mut roots,
             DefinitionSource::UserClawConfigHome,
@@ -2604,7 +2625,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         push_unique_root(
             &mut roots,
             DefinitionSource::UserClaw,
-            home.join(".claw").join(leaf),
+            home.join(".claude").join(leaf),
         );
         push_unique_root(
             &mut roots,
@@ -2629,7 +2650,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
-            ancestor.join(".claw").join("skills"),
+            ancestor.join(".claude").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
@@ -2659,7 +2680,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::ProjectClaw,
-            ancestor.join(".claw").join("commands"),
+            ancestor.join(".claude").join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
         push_unique_skill_root(
@@ -2676,7 +2697,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+    if let Ok(claw_config_home) = env::var("CLAUDE_CONFIG_HOME") {
         let claw_config_home = PathBuf::from(claw_config_home);
         push_unique_skill_root(
             &mut roots,
@@ -2713,7 +2734,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaw,
-            home.join(".claw").join("skills"),
+            home.join(".claude").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
@@ -2725,7 +2746,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserClaw,
-            home.join(".claw").join("commands"),
+            home.join(".claude").join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
         push_unique_skill_root(
@@ -2783,6 +2804,47 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
+    // Discover plugin command roots from the Claude Code-compatible cache.
+    // Cache structure: <config_home>/plugins/cache/<marketplace>/<name>/<version>/
+    // Each plugin version directory may contain a `commands/` subdirectory with
+    // markdown command files that become `plugin-name:command-name` skills.
+    let plugin_cache_root = runtime::default_config_home().join("plugins").join("cache");
+    if let Ok(marketplaces) = fs::read_dir(&plugin_cache_root) {
+        for marketplace_entry in marketplaces.flatten() {
+            if !marketplace_entry.path().is_dir() {
+                continue;
+            }
+            if let Ok(names) = fs::read_dir(marketplace_entry.path()) {
+                for name_entry in names.flatten() {
+                    let name_path = name_entry.path();
+                    if !name_path.is_dir() {
+                        continue;
+                    }
+                    let plugin_name = name_entry.file_name().to_string_lossy().to_string();
+                    if let Ok(versions) = fs::read_dir(&name_path) {
+                        for version_entry in versions.flatten() {
+                            let version_path = version_entry.path();
+                            if !version_path.is_dir() {
+                                continue;
+                            }
+                            let commands_dir = version_path.join("commands");
+                            if commands_dir.is_dir() {
+                                push_unique_skill_root(
+                                    &mut roots,
+                                    DefinitionSource::Plugin,
+                                    commands_dir,
+                                    SkillOrigin::PluginCommands {
+                                        plugin_name: plugin_name.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     roots
 }
 
@@ -2837,18 +2899,18 @@ fn install_skill_into(
 }
 
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
-    if let Ok(claw_config_home) = env::var("CLAW_CONFIG_HOME") {
+    if let Ok(claw_config_home) = env::var("CLAUDE_CONFIG_HOME") {
         return Ok(PathBuf::from(claw_config_home).join("skills"));
     }
     if let Ok(codex_home) = env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home).join("skills"));
     }
     if let Some(home) = env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".claw").join("skills"));
+        return Ok(PathBuf::from(home).join(".claude").join("skills"));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "unable to resolve a skills install root; set CLAW_CONFIG_HOME or HOME",
+        "unable to resolve a skills install root; set CLAUDE_CONFIG_HOME or HOME",
     ))
 }
 
@@ -3061,7 +3123,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
         let mut root_skills = Vec::new();
         for entry in fs::read_dir(&root.path)? {
             let entry = entry?;
-            match root.origin {
+            match &root.origin {
                 SkillOrigin::SkillsDir => {
                     if !entry.path().is_dir() {
                         continue;
@@ -3078,7 +3140,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                         description,
                         source: root.source,
                         shadowed_by: None,
-                        origin: root.origin,
+                        origin: root.origin.clone(),
                     });
                 }
                 SkillOrigin::LegacyCommandsDir => {
@@ -3109,7 +3171,33 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                         description,
                         source: root.source,
                         shadowed_by: None,
-                        origin: root.origin,
+                        origin: root.origin.clone(),
+                    });
+                }
+                SkillOrigin::PluginCommands { plugin_name } => {
+                    // Plugin commands are .md files in the commands/ directory.
+                    // Names are prefixed with `plugin_name:` to form the
+                    // `plugin-name:command-name` namespace.
+                    let path = entry.path();
+                    if !path
+                        .extension()
+                        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+                    {
+                        continue;
+                    }
+                    let contents = fs::read_to_string(&path)?;
+                    let fallback_name = path.file_stem().map_or_else(
+                        || entry.file_name().to_string_lossy().to_string(),
+                        |stem| stem.to_string_lossy().to_string(),
+                    );
+                    let (name, description) = parse_skill_frontmatter(&contents);
+                    let command_name = name.unwrap_or(fallback_name);
+                    root_skills.push(SkillSummary {
+                        name: format!("{plugin_name}:{command_name}"),
+                        description,
+                        source: root.source,
+                        shadowed_by: None,
+                        origin: root.origin.clone(),
                     });
                 }
             }
@@ -3154,15 +3242,30 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
-    let mut lines = contents.lines();
+/// Parse YAML frontmatter from a SKILL.md file, extracting `name` and
+/// `description` fields.  The frontmatter is delimited by `---` lines at the
+/// top of the file.
+///
+/// Multi-line descriptions are supported via:
+///   - YAML folded scalar (`description: >`): continuation lines are joined
+///     with a single space (newlines become spaces).
+///   - YAML literal scalar (`description: |`): continuation lines are joined
+///     with literal newlines preserved.
+///   - Plain continuation: indented lines following `description:` with a
+///     non-empty inline value are NOT treated as continuation (only `>` / `|`
+///     trigger multi-line collection).
+///
+/// Quoted values (single or double quotes) are unquoted automatically.
+pub fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
+    let mut lines = contents.lines().peekable();
     if lines.next().map(str::trim) != Some("---") {
         return (None, None);
     }
 
     let mut name = None;
     let mut description = None;
-    for line in lines {
+
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed == "---" {
             break;
@@ -3175,9 +3278,43 @@ fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("description:") {
-            let value = unquote_frontmatter_value(value.trim());
-            if !value.is_empty() {
-                description = Some(value);
+            let value_str = value.trim();
+
+            // Check for YAML block scalar indicators: `>` (folded) or `|`
+            // (literal).
+            if value_str == ">" || value_str == "|" {
+                let is_folded = value_str == ">";
+                let mut parts = Vec::new();
+                // Collect indented continuation lines until we hit a
+                // non-indented line or the closing `---`.
+                while let Some(next) = lines.peek() {
+                    let next_trimmed = next.trim();
+                    // Stop at frontmatter end or a new key (non-indented line
+                    // containing `:`).
+                    if next_trimmed == "---" {
+                        break;
+                    }
+                    // Continuation lines must be indented (start with
+                    // whitespace).
+                    if !next.starts_with(' ') && !next.starts_with('\t') {
+                        break;
+                    }
+                    parts.push(next_trimmed.to_string());
+                    lines.next();
+                }
+                let joined = if is_folded {
+                    parts.join(" ")
+                } else {
+                    parts.join("\n")
+                };
+                if !joined.is_empty() {
+                    description = Some(joined);
+                }
+            } else {
+                let value = unquote_frontmatter_value(value_str);
+                if !value.is_empty() {
+                    description = Some(value);
+                }
             }
         }
     }
@@ -3185,7 +3322,10 @@ fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
     (name, description)
 }
 
-fn unquote_frontmatter_value(value: &str) -> String {
+/// Remove surrounding quotes (single or double) from a YAML frontmatter
+/// value string.
+#[must_use]
+pub fn unquote_frontmatter_value(value: &str) -> String {
     value
         .strip_prefix('"')
         .and_then(|trimmed| trimmed.strip_suffix('"'))
@@ -3293,6 +3433,7 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
+        DefinitionScope::Plugin,
     ] {
         let group = skills
             .iter()
@@ -3539,8 +3680,9 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
-        "  Direct CLI       claw agents".to_string(),
-        "  Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents".to_string(),
+        "  Direct CLI       claude agents".to_string(),
+        "  Sources          .claude/agents, ~/.claude/agents, $CLAUDE_CONFIG_HOME/agents"
+            .to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3554,8 +3696,8 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/agents [list|help]",
-            "direct_cli": "claw agents [list|help]",
-            "sources": [".claw/agents", "~/.claw/agents", "$CLAW_CONFIG_HOME/agents"],
+            "direct_cli": "claude agents [list|help]",
+            "sources": [".claude/agents", "~/.claude/agents", "$CLAUDE_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
     })
@@ -3566,10 +3708,10 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "Skills".to_string(),
         "  Usage            /skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Alias            /skill".to_string(),
-        "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
+        "  Direct CLI       claude skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
-        "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
-        "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
+        "  Install root     $CLAUDE_CONFIG_HOME/skills or ~/.claude/skills".to_string(),
+        "  Sources          .claude/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claude/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3584,16 +3726,16 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/skills [list|install <path>|help|<skill> [args]]",
             "aliases": ["/skill"],
-            "direct_cli": "claw skills [list|install <path>|help|<skill> [args]]",
+            "direct_cli": "claude skills [list|install <path>|help|<skill> [args]]",
             "invoke": "/skills help overview -> $help overview",
-            "install_root": "$CLAW_CONFIG_HOME/skills or ~/.claw/skills",
+            "install_root": "$CLAUDE_CONFIG_HOME/skills or ~/.claude/skills",
             "sources": [
-                ".claw/skills",
+                ".claude/skills",
                 ".omc/skills",
                 ".agents/skills",
                 ".codex/skills",
                 ".claude/skills",
-                "~/.claw/skills",
+                "~/.claude/skills",
                 "~/.omc/skills",
                 "~/.claude/skills/omc-learned",
                 "~/.codex/skills",
@@ -3610,8 +3752,8 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
-        "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
+        "  Direct CLI       claude mcp [list|show <server>|help]".to_string(),
+        "  Sources          .claude/settings.json, .claude/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3625,8 +3767,8 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "action": "help",
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
-            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+            "direct_cli": "claude mcp [list|show <server>|help]",
+            "sources": [".claude/settings.json", ".claude/settings.local.json"],
         },
         "unexpected": unexpected,
     })
@@ -3719,6 +3861,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
             "user_claw"
         }
+        DefinitionSource::Plugin => "plugin",
     }
 }
 
@@ -3741,14 +3884,15 @@ fn agent_summary_json(agent: &AgentSummary) -> Value {
     })
 }
 
-fn skill_origin_id(origin: SkillOrigin) -> &'static str {
+fn skill_origin_id(origin: &SkillOrigin) -> &'static str {
     match origin {
         SkillOrigin::SkillsDir => "skills_dir",
         SkillOrigin::LegacyCommandsDir => "legacy_commands_dir",
+        SkillOrigin::PluginCommands { .. } => "plugin_commands",
     }
 }
 
-fn skill_origin_json(origin: SkillOrigin) -> Value {
+fn skill_origin_json(origin: &SkillOrigin) -> Value {
     json!({
         "id": skill_origin_id(origin),
         "detail_label": origin.detail_label(),
@@ -3760,7 +3904,7 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
         "name": &skill.name,
         "description": &skill.description,
         "source": definition_source_json(skill.source),
-        "origin": skill_origin_json(skill.origin),
+        "origin": skill_origin_json(&skill.origin),
         "active": skill.shadowed_by.is_none(),
         "shadowed_by": skill.shadowed_by.map(definition_source_json),
     })
@@ -4421,7 +4565,7 @@ mod tests {
 
         // then
         assert!(help.contains("/plugin"));
-        assert!(help.contains("Summary          Manage Claw Code plugins"));
+        assert!(help.contains("Summary          Manage Claude Code plugins"));
         assert!(help.contains("Aliases          /plugins, /marketplace"));
         assert!(help.contains("Category         Workspace & git"));
     }
@@ -4714,7 +4858,7 @@ mod tests {
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["direct_cli"], "claw agents [list|help]");
+        assert_eq!(help["usage"]["direct_cli"], "claude agents [list|help]");
 
         let unexpected = handle_agents_slash_command_json(Some("show planner"), &workspace)
             .expect("agents usage");
@@ -4774,8 +4918,8 @@ mod tests {
     #[test]
     fn resolves_project_skills_and_legacy_commands_from_shared_registry() {
         let workspace = temp_dir("resolve-project-skills");
-        let project_skills = workspace.join(".claw").join("skills");
-        let legacy_commands = workspace.join(".claw").join("commands");
+        let project_skills = workspace.join(".claude").join("skills");
+        let legacy_commands = workspace.join(".claude").join("commands");
 
         write_skill(&project_skills, "plan", "Project planning guidance");
         write_legacy_command(&legacy_commands, "handoff", "Legacy handoff guidance");
@@ -4839,7 +4983,7 @@ mod tests {
         assert_eq!(help["usage"]["aliases"][0], "/skill");
         assert_eq!(
             help["usage"]["direct_cli"],
-            "claw skills [list|install <path>|help|<skill> [args]]"
+            "claude skills [list|install <path>|help|<skill> [args]]"
         );
 
         let _ = fs::remove_dir_all(workspace);
@@ -4853,9 +4997,10 @@ mod tests {
         let agents_help =
             super::handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
-        assert!(agents_help
-            .contains("Sources          .claw/agents, ~/.claw/agents, $CLAW_CONFIG_HOME/agents"));
+        assert!(agents_help.contains("Direct CLI       claude agents"));
+        assert!(agents_help.contains(
+            "Sources          .claude/agents, ~/.claude/agents, $CLAUDE_CONFIG_HOME/agents"
+        ));
 
         let agents_unexpected =
             super::handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
@@ -4867,7 +5012,9 @@ mod tests {
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Alias            /skill"));
         assert!(skills_help.contains("Invoke           /skills help overview -> $help overview"));
-        assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
+        assert!(
+            skills_help.contains("Install root     $CLAUDE_CONFIG_HOME/skills or ~/.claude/skills")
+        );
         assert!(skills_help.contains(".omc/skills"));
         assert!(skills_help.contains(".agents/skills"));
         assert!(skills_help.contains("~/.claude/skills/omc-learned"));
@@ -4977,7 +5124,7 @@ mod tests {
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("Direct CLI       claude mcp [list|show <server>|help]"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5000,10 +5147,10 @@ mod tests {
     fn renders_mcp_reports_from_loaded_config() {
         let workspace = temp_dir("mcp-config-workspace");
         let config_home = temp_dir("mcp-config-home");
-        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(workspace.join(".claude")).expect("workspace config dir");
         fs::create_dir_all(&config_home).expect("config home");
         fs::write(
-            workspace.join(".claw").join("settings.json"),
+            workspace.join(".claude").join("settings.json"),
             r#"{
               "mcpServers": {
                 "alpha": {
@@ -5027,7 +5174,7 @@ mod tests {
         )
         .expect("write settings");
         fs::write(
-            workspace.join(".claw").join("settings.local.json"),
+            workspace.join(".claude").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote": {
@@ -5077,10 +5224,10 @@ mod tests {
     fn renders_mcp_reports_as_json() {
         let workspace = temp_dir("mcp-json-workspace");
         let config_home = temp_dir("mcp-json-home");
-        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(workspace.join(".claude")).expect("workspace config dir");
         fs::create_dir_all(&config_home).expect("config home");
         fs::write(
-            workspace.join(".claw").join("settings.json"),
+            workspace.join(".claude").join("settings.json"),
             r#"{
               "mcpServers": {
                 "alpha": {
@@ -5104,7 +5251,7 @@ mod tests {
         )
         .expect("write settings");
         fs::write(
-            workspace.join(".claw").join("settings.local.json"),
+            workspace.join(".claude").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote": {
@@ -5149,7 +5296,7 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+        assert_eq!(help["usage"]["sources"][0], ".claude/settings.json");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
@@ -5161,6 +5308,99 @@ mod tests {
         let (name, description) = super::parse_skill_frontmatter(contents);
         assert_eq!(name.as_deref(), Some("hud"));
         assert_eq!(description.as_deref(), Some("Quoted description"));
+    }
+
+    #[test]
+    fn parses_unquoted_frontmatter_values() {
+        let contents = "---\nname: build\ndescription: Run the build pipeline\n---\n# Build\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("build"));
+        assert_eq!(description.as_deref(), Some("Run the build pipeline"));
+    }
+
+    #[test]
+    fn description_with_colons_not_split() {
+        // Colons inside the value must not be truncated.
+        let contents =
+            "---\nname: build\ndescription: \"Use when: the user says 'build' or 'compile'\"\n---\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("build"));
+        assert_eq!(
+            description.as_deref(),
+            Some("Use when: the user says 'build' or 'compile'")
+        );
+    }
+
+    #[test]
+    fn description_with_unquoted_colons() {
+        // Unquoted values with colons should also work — `strip_prefix("description:")`
+        // only removes the key prefix, leaving everything after as the value.
+        let contents = "---\nname: ship\ndescription: Use when: shipping code to remote\n---\n";
+        let (_name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(
+            description.as_deref(),
+            Some("Use when: shipping code to remote")
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_frontmatter() {
+        let contents = "# No frontmatter\nJust markdown body.\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert!(name.is_none());
+        assert!(description.is_none());
+    }
+
+    #[test]
+    fn returns_none_for_empty_values() {
+        let contents = "---\nname:\ndescription:\n---\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert!(name.is_none());
+        assert!(description.is_none());
+    }
+
+    #[test]
+    fn ignores_description_in_body_text() {
+        // A line like `description: something` in the body (after closing ---)
+        // must NOT be picked up.
+        let contents = "---\nname: test\n---\ndescription: body text not frontmatter\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("test"));
+        assert!(description.is_none());
+    }
+
+    #[test]
+    fn multiline_folded_description() {
+        // YAML folded scalar `>` — newlines become spaces.
+        let contents = "---\nname: build\ndescription: >\n  First line\n  second line\n---\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("build"));
+        assert_eq!(description.as_deref(), Some("First line second line"));
+    }
+
+    #[test]
+    fn multiline_literal_description() {
+        // YAML literal scalar `|` — newlines preserved.
+        let contents = "---\nname: notes\ndescription: |\n  Line one\n  Line two\n---\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("notes"));
+        assert_eq!(description.as_deref(), Some("Line one\nLine two"));
+    }
+
+    #[test]
+    fn multiline_stops_at_next_key() {
+        // Multi-line collection must stop when hitting a non-indented key line.
+        let contents = "---\ndescription: >\n  First part\n  second part\nname: myskill\n---\n";
+        let (name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(name.as_deref(), Some("myskill"));
+        assert_eq!(description.as_deref(), Some("First part second part"));
+    }
+
+    #[test]
+    fn multiline_stops_at_closing_delimiter() {
+        let contents = "---\nname: x\ndescription: |\n  Only line\n---\n";
+        let (_name, description) = super::parse_skill_frontmatter(contents);
+        assert_eq!(description.as_deref(), Some("Only line"));
     }
 
     #[test]

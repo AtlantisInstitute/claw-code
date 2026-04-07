@@ -7,7 +7,7 @@ use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 /// Schema name advertised by generated settings files.
-pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
+pub const CLAUDE_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,6 +61,7 @@ pub struct RuntimeFeatureConfig {
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
+    enable_all_project_mcp_servers: bool,
 }
 
 /// Hook command lists grouped by lifecycle stage.
@@ -228,8 +229,12 @@ impl ConfigLoader {
     #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
         let user_legacy_path = self.config_home.parent().map_or_else(
-            || PathBuf::from(".claw.json"),
-            |parent| parent.join(".claw.json"),
+            || PathBuf::from(".claude.json"),
+            |parent| parent.join(".claude.json"),
+        );
+        let user_mcp_path = self.config_home.parent().map_or_else(
+            || PathBuf::from(".mcp.json"),
+            |parent| parent.join(".mcp.json"),
         );
         vec![
             ConfigEntry {
@@ -240,17 +245,27 @@ impl ConfigLoader {
                 source: ConfigSource::User,
                 path: self.config_home.join("settings.json"),
             },
+            // Global .mcp.json (e.g. ~/.mcp.json)
             ConfigEntry {
-                source: ConfigSource::Project,
-                path: self.cwd.join(".claw.json"),
+                source: ConfigSource::User,
+                path: user_mcp_path,
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw").join("settings.json"),
+                path: self.cwd.join(".claude.json"),
+            },
+            ConfigEntry {
+                source: ConfigSource::Project,
+                path: self.cwd.join(".claude").join("settings.json"),
+            },
+            // Project-root .mcp.json (Claude Code convention)
+            ConfigEntry {
+                source: ConfigSource::Project,
+                path: self.cwd.join(".mcp.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Local,
-                path: self.cwd.join(".claw").join("settings.local.json"),
+                path: self.cwd.join(".claude").join("settings.local.json"),
             },
         ]
     }
@@ -283,6 +298,7 @@ impl ConfigLoader {
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
+            enable_all_project_mcp_servers: parse_optional_enable_all_project_mcp(&merged_value),
         };
 
         Ok(RuntimeConfig {
@@ -367,6 +383,11 @@ impl RuntimeConfig {
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
+
+    #[must_use]
+    pub fn enable_all_project_mcp_servers(&self) -> bool {
+        self.feature_config.enable_all_project_mcp_servers
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -421,6 +442,11 @@ impl RuntimeFeatureConfig {
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
     }
+
+    #[must_use]
+    pub fn enable_all_project_mcp_servers(&self) -> bool {
+        self.enable_all_project_mcp_servers
+    }
 }
 
 impl RuntimePluginConfig {
@@ -465,10 +491,10 @@ impl RuntimePluginConfig {
 #[must_use]
 /// Returns the default per-user config directory used by the runtime.
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("CLAW_CONFIG_HOME")
+    std::env::var_os("CLAUDE_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
-        .unwrap_or_else(|| PathBuf::from(".claw"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .unwrap_or_else(|| PathBuf::from(".claude"))
 }
 
 impl RuntimeHookConfig {
@@ -575,7 +601,7 @@ impl McpServerConfig {
 fn read_optional_json_object(
     path: &Path,
 ) -> Result<Option<BTreeMap<String, JsonValue>>, ConfigError> {
-    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
+    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claude.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -749,6 +775,13 @@ fn parse_permission_mode_label(
             "{context}: unsupported permission mode {other}"
         ))),
     }
+}
+
+fn parse_optional_enable_all_project_mcp(root: &JsonValue) -> bool {
+    root.as_object()
+        .and_then(|object| object.get("enableAllProjectMcpServers"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
 }
 
 fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, ConfigError> {
@@ -1087,7 +1120,7 @@ mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
         McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        RuntimePluginConfig, CLAUDE_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -1106,7 +1139,7 @@ mod tests {
     fn rejects_non_object_settings_files() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".claude");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "[]").expect("write bad settings");
@@ -1127,12 +1160,12 @@ mod tests {
     fn loads_and_merges_claude_code_config_files_by_precedence() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.parent().expect("home parent").join(".claw.json"),
+            home.parent().expect("home parent").join(".claude.json"),
             r#"{"model":"haiku","env":{"A":"1"},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
         .expect("write user compat config");
@@ -1142,17 +1175,17 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".claw.json"),
+            cwd.join(".claude.json"),
             r#"{"model":"project-compat","env":{"B":"2"}}"#,
         )
         .expect("write project compat config");
         fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".claude").join("settings.json"),
             r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".claude").join("settings.local.json"),
             r#"{"model":"opus","permissionMode":"acceptEdits"}"#,
         )
         .expect("write local settings");
@@ -1161,7 +1194,7 @@ mod tests {
             .load()
             .expect("config should load");
 
-        assert_eq!(CLAW_SETTINGS_SCHEMA_NAME, "SettingsSchema");
+        assert_eq!(CLAUDE_SETTINGS_SCHEMA_NAME, "SettingsSchema");
         assert_eq!(loaded.loaded_entries().len(), 5);
         assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
         assert_eq!(
@@ -1213,12 +1246,12 @@ mod tests {
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".claude").join("settings.local.json"),
             r#"{
               "sandbox": {
                 "enabled": true,
@@ -1251,8 +1284,8 @@ mod tests {
     fn parses_typed_mcp_and_oauth_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1289,7 +1322,7 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".claude").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote-server": {
@@ -1342,7 +1375,7 @@ mod tests {
     fn infers_http_mcp_servers_from_url_only_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".claude");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -1380,8 +1413,8 @@ mod tests {
     fn parses_plugin_config_from_enabled_plugins() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1418,8 +1451,8 @@ mod tests {
     fn parses_plugin_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1471,7 +1504,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".claude");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -1498,7 +1531,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".claude");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "").expect("write empty settings");
@@ -1553,9 +1586,9 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        let project_settings = cwd.join(".claw").join("settings.json");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".claude");
+        let project_settings = cwd.join(".claude").join("settings.json");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1644,5 +1677,166 @@ mod tests {
         assert!(config.state_for("known", false));
         assert!(config.state_for("missing", true));
         assert!(!config.state_for("missing", false));
+    }
+
+    #[test]
+    fn discovers_mcp_servers_from_dot_mcp_json_at_project_root() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        // Write .mcp.json at project root with a stdio server
+        fs::write(
+            cwd.join(".mcp.json"),
+            r#"{
+              "mcpServers": {
+                "memory": {
+                  "command": "npx",
+                  "args": ["-y", "@anthropic/memory-server"],
+                  "env": { "MEMORY_DIR": "/tmp/memory" }
+                }
+              }
+            }"#,
+        )
+        .expect("write project .mcp.json");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.mcp().get("memory").is_some());
+        let memory_server = loaded.mcp().get("memory").unwrap();
+        assert_eq!(memory_server.scope, ConfigSource::Project);
+        assert_eq!(memory_server.transport(), McpTransport::Stdio);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn discovers_mcp_servers_from_global_dot_mcp_json() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        // Write .mcp.json at user home (sibling of .claude/)
+        fs::write(
+            root.join("home").join(".mcp.json"),
+            r#"{
+              "mcpServers": {
+                "global-memory": {
+                  "command": "node",
+                  "args": ["memory-server.js"]
+                }
+              }
+            }"#,
+        )
+        .expect("write global .mcp.json");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.mcp().get("global-memory").is_some());
+        let server = loaded.mcp().get("global-memory").unwrap();
+        assert_eq!(server.scope, ConfigSource::User);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn project_mcp_json_overrides_global_mcp_json_for_same_server_name() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        // Global .mcp.json defines "shared" server
+        fs::write(
+            root.join("home").join(".mcp.json"),
+            r#"{
+              "mcpServers": {
+                "shared": {
+                  "command": "global-server",
+                  "args": ["--global"]
+                }
+              }
+            }"#,
+        )
+        .expect("write global .mcp.json");
+
+        // Project .mcp.json also defines "shared" server
+        fs::write(
+            cwd.join(".mcp.json"),
+            r#"{
+              "mcpServers": {
+                "shared": {
+                  "command": "project-server",
+                  "args": ["--project"]
+                }
+              }
+            }"#,
+        )
+        .expect("write project .mcp.json");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        let server = loaded.mcp().get("shared").unwrap();
+        // Project-scope should win over user-scope
+        assert_eq!(server.scope, ConfigSource::Project);
+        match &server.config {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(stdio.command, "project-server");
+            }
+            other => panic!("expected stdio config, got {other:?}"),
+        }
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_enable_all_project_mcp_servers_setting() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".claude").join("settings.local.json"),
+            r#"{"enableAllProjectMcpServers": true}"#,
+        )
+        .expect("write local settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.enable_all_project_mcp_servers());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn enable_all_project_mcp_servers_defaults_to_false() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(!loaded.enable_all_project_mcp_servers());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

@@ -1,6 +1,6 @@
-# Claw Code Usage
+# Claude Code Usage
 
-This guide covers the current Rust workspace under `rust/` and the `claw` CLI binary. If you are brand new, make the doctor health check your first run: start `claw`, then run `/doctor`.
+This guide covers the current Rust workspace under `rust/` and the `claude` CLI binary. If you are brand new, make the doctor health check your first run: start `claude`, then run `/doctor`.
 
 ## Quick-start health check
 
@@ -9,19 +9,19 @@ Run this before prompts, sessions, or automation:
 ```bash
 cd rust
 cargo build --workspace
-./target/debug/claw
+./target/debug/claude
 # first command inside the REPL
 /doctor
 ```
 
-`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claw --resume latest /doctor`.
+`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claude --resume latest /doctor`.
 
 ## Prerequisites
 
 - Rust toolchain with `cargo`
 - One of:
   - `ANTHROPIC_API_KEY` for direct API access
-  - `claw login` for OAuth-based auth
+  - `claude login` for OAuth-based auth
 - Optional: `ANTHROPIC_BASE_URL` when targeting a proxy or local service
 
 ## Install / build the workspace
@@ -31,7 +31,7 @@ cd rust
 cargo build --workspace
 ```
 
-The CLI binary is available at `rust/target/debug/claw` after a debug build. Make the doctor check above your first post-build step.
+The CLI binary is available at `rust/target/debug/claude` after a debug build. Make the doctor check above your first post-build step.
 
 ## Quick start
 
@@ -39,7 +39,7 @@ The CLI binary is available at `rust/target/debug/claw` after a debug build. Mak
 
 ```bash
 cd rust
-./target/debug/claw
+./target/debug/claude
 /doctor
 ```
 
@@ -47,38 +47,38 @@ cd rust
 
 ```bash
 cd rust
-./target/debug/claw
+./target/debug/claude
 ```
 
 ### One-shot prompt
 
 ```bash
 cd rust
-./target/debug/claw prompt "summarize this repository"
+./target/debug/claude prompt "summarize this repository"
 ```
 
 ### Shorthand prompt mode
 
 ```bash
 cd rust
-./target/debug/claw "explain rust/crates/runtime/src/lib.rs"
+./target/debug/claude "explain rust/crates/runtime/src/lib.rs"
 ```
 
 ### JSON output for scripting
 
 ```bash
 cd rust
-./target/debug/claw --output-format json prompt "status"
+./target/debug/claude --output-format json prompt "status"
 ```
 
 ## Model and permission controls
 
 ```bash
 cd rust
-./target/debug/claw --model sonnet prompt "review this diff"
-./target/debug/claw --permission-mode read-only prompt "summarize Cargo.toml"
-./target/debug/claw --permission-mode workspace-write prompt "update README.md"
-./target/debug/claw --allowedTools read,glob "inspect the runtime crate"
+./target/debug/claude --model sonnet prompt "review this diff"
+./target/debug/claude --permission-mode read-only prompt "summarize Cargo.toml"
+./target/debug/claude --permission-mode workspace-write prompt "update README.md"
+./target/debug/claude --allowedTools read,glob "inspect the runtime crate"
 ```
 
 Supported permission modes:
@@ -105,13 +105,13 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ```bash
 cd rust
-./target/debug/claw login
-./target/debug/claw logout
+./target/debug/claude login
+./target/debug/claude logout
 ```
 
 ## Local Models
 
-`claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services. OAuth is Anthropic-only, so when `OPENAI_BASE_URL` is set you should use API-key style auth instead of `claw login`.
+`claude` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services. OAuth is Anthropic-only, so when `OPENAI_BASE_URL` is set you should use API-key style auth instead of `claude login`.
 
 ### Anthropic-compatible endpoint
 
@@ -120,7 +120,7 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 export ANTHROPIC_AUTH_TOKEN="local-dev-token"
 
 cd rust
-./target/debug/claw --model "claude-sonnet-4-6" prompt "reply with the word ready"
+./target/debug/claude --model "claude-sonnet-4-6" prompt "reply with the word ready"
 ```
 
 ### OpenAI-compatible endpoint
@@ -130,7 +130,7 @@ export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
 export OPENAI_API_KEY="local-dev-token"
 
 cd rust
-./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
+./target/debug/claude --model "qwen2.5-coder" prompt "reply with the word ready"
 ```
 
 ### Ollama
@@ -140,7 +140,7 @@ export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
 unset OPENAI_API_KEY
 
 cd rust
-./target/debug/claw --model "llama3.2" prompt "summarize this repository in one sentence"
+./target/debug/claude --model "llama3.2" prompt "summarize this repository in one sentence"
 ```
 
 ### OpenRouter
@@ -150,29 +150,29 @@ export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_API_KEY="sk-or-v1-..."
 
 cd rust
-./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
+./target/debug/claude --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
 ## Common operational commands
 
 ```bash
 cd rust
-./target/debug/claw status
-./target/debug/claw sandbox
-./target/debug/claw agents
-./target/debug/claw mcp
-./target/debug/claw skills
-./target/debug/claw system-prompt --cwd .. --date 2026-04-04
+./target/debug/claude status
+./target/debug/claude sandbox
+./target/debug/claude agents
+./target/debug/claude mcp
+./target/debug/claude skills
+./target/debug/claude system-prompt --cwd .. --date 2026-04-04
 ```
 
 ## Session management
 
-REPL turns are persisted under `.claw/sessions/` in the current workspace.
+REPL turns are persisted under `.claude/sessions/` in the current workspace.
 
 ```bash
 cd rust
-./target/debug/claw --resume latest
-./target/debug/claw --resume latest /status /diff
+./target/debug/claude --resume latest
+./target/debug/claude --resume latest /status /diff
 ```
 
 Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, and `/export`.

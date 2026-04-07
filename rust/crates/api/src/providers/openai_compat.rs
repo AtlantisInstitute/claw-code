@@ -133,12 +133,7 @@ impl OpenAiCompatClient {
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(
-                self.config.provider_name,
-                &request.model,
-                &body,
-                error,
-            )
+            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
         })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
@@ -158,10 +153,7 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(
-                self.config.provider_name,
-                request.model.clone(),
-            ),
+            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),

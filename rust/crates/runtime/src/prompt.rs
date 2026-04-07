@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::config::{default_config_home, ConfigError, ConfigLoader, RuntimeConfig};
 
 /// Errors raised while assembling the final system prompt.
 #[derive(Debug)]
@@ -41,6 +41,9 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+/// Maximum byte size for a single rules file to prevent loading binary or
+/// excessively large files from the `.claude/rules/` directory.
+const MAX_RULES_FILE_BYTES: u64 = 100_000;
 
 /// Contents of an instruction file included in prompt construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,16 +208,29 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     }
     directories.reverse();
 
+    // Start with global rules from the user config home (~/.claude/rules/).
     let mut files = Vec::new();
+    let config_home = default_config_home();
+    let global_rules_dir = config_home.join("rules");
+    if global_rules_dir.is_dir() {
+        // Use config_home parent as the "directory" so discover_rules_in_dir
+        // looks at <config_home_parent>/.claude/rules/.
+        if let Some(parent) = config_home.parent() {
+            discover_rules_in_dir(&mut files, parent)?;
+        }
+    }
+
     for dir in directories {
         for candidate in [
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
-            dir.join(".claw").join("CLAUDE.md"),
-            dir.join(".claw").join("instructions.md"),
+            dir.join(".claude").join("CLAUDE.md"),
+            dir.join(".claude").join("instructions.md"),
         ] {
             push_context_file(&mut files, candidate)?;
         }
+        // Scan .claude/rules/*.md at each directory level.
+        discover_rules_in_dir(&mut files, &dir)?;
     }
     Ok(dedupe_instruction_files(files))
 }
@@ -229,6 +245,42 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Scans `<dir>/.claude/rules/` for `.md` files and appends them as context
+/// files. Non-markdown files (e.g. `.gitkeep`) and files exceeding
+/// [`MAX_RULES_FILE_BYTES`] are silently skipped.
+fn discover_rules_in_dir(files: &mut Vec<ContextFile>, dir: &Path) -> std::io::Result<()> {
+    let rules_dir = dir.join(".claude").join("rules");
+    let entries = match fs::read_dir(&rules_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let path = entry.path();
+            let is_md = path
+                .extension()
+                .map_or(false, |ext| ext.eq_ignore_ascii_case("md"));
+            let within_size = entry
+                .metadata()
+                .map(|m| m.len() <= MAX_RULES_FILE_BYTES)
+                .unwrap_or(false);
+            is_md && within_size
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    // Sort alphabetically for deterministic ordering.
+    paths.sort();
+
+    for path in paths {
+        push_context_file(files, path)?;
+    }
+    Ok(())
 }
 
 fn read_git_status(cwd: &Path) -> Option<String> {
@@ -429,7 +481,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
-            "No Claw Code settings files loaded.".to_string()
+            "No Claude Code settings files loaded.".to_string()
         ]));
         return lines.join("\n");
     }
@@ -532,23 +584,23 @@ mod tests {
     fn discovers_instruction_files_from_ancestor_chain() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
-        fs::create_dir_all(nested.join(".claw")).expect("nested claw dir");
+        fs::create_dir_all(nested.join(".claude")).expect("nested claw dir");
         fs::write(root.join("CLAUDE.md"), "root instructions").expect("write root instructions");
         fs::write(root.join("CLAUDE.local.md"), "local instructions")
             .expect("write local instructions");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
-        fs::create_dir_all(root.join("apps").join(".claw")).expect("apps claw dir");
+        fs::create_dir_all(root.join("apps").join(".claude")).expect("apps claw dir");
         fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
             .expect("write apps instructions");
         fs::write(
-            root.join("apps").join(".claw").join("instructions.md"),
+            root.join("apps").join(".claude").join("instructions.md"),
             "apps dot claude instructions",
         )
         .expect("write apps dot claude instructions");
-        fs::write(nested.join(".claw").join("CLAUDE.md"), "nested rules")
+        fs::write(nested.join(".claude").join("CLAUDE.md"), "nested rules")
             .expect("write nested rules");
         fs::write(
-            nested.join(".claw").join("instructions.md"),
+            nested.join(".claude").join("instructions.md"),
             "nested instructions",
         )
         .expect("write nested instructions");
@@ -608,7 +660,7 @@ mod tests {
     #[test]
     fn displays_context_paths_compactly() {
         assert_eq!(
-            display_context_path(Path::new("/tmp/project/.claw/CLAUDE.md")),
+            display_context_path(Path::new("/tmp/project/.claude/CLAUDE.md")),
             "CLAUDE.md"
         );
     }
@@ -686,10 +738,10 @@ mod tests {
     #[test]
     fn load_system_prompt_reads_claude_files_and_config() {
         let root = temp_dir();
-        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        fs::create_dir_all(root.join(".claude")).expect("claw dir");
         fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
         fs::write(
-            root.join(".claw").join("settings.json"),
+            root.join(".claude").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
@@ -698,9 +750,9 @@ mod tests {
         ensure_valid_cwd();
         let previous = std::env::current_dir().expect("cwd");
         let original_home = std::env::var("HOME").ok();
-        let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_claw_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
         std::env::set_var("HOME", &root);
-        std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
+        std::env::set_var("CLAUDE_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
         let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
             .expect("system prompt should load")
@@ -716,9 +768,9 @@ mod tests {
             std::env::remove_var("HOME");
         }
         if let Some(value) = original_claw_home {
-            std::env::set_var("CLAW_CONFIG_HOME", value);
+            std::env::set_var("CLAUDE_CONFIG_HOME", value);
         } else {
-            std::env::remove_var("CLAW_CONFIG_HOME");
+            std::env::remove_var("CLAUDE_CONFIG_HOME");
         }
 
         assert!(prompt.contains("Project rules"));
@@ -729,10 +781,10 @@ mod tests {
     #[test]
     fn renders_claude_code_style_sections_with_project_context() {
         let root = temp_dir();
-        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        fs::create_dir_all(root.join(".claude")).expect("claw dir");
         fs::write(root.join("CLAUDE.md"), "Project rules").expect("write CLAUDE.md");
         fs::write(
-            root.join(".claw").join("settings.json"),
+            root.join(".claude").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
@@ -771,9 +823,9 @@ mod tests {
     fn discovers_dot_claude_instructions_markdown() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
-        fs::create_dir_all(nested.join(".claw")).expect("nested claw dir");
+        fs::create_dir_all(nested.join(".claude")).expect("nested claw dir");
         fs::write(
-            nested.join(".claw").join("instructions.md"),
+            nested.join(".claude").join("instructions.md"),
             "instruction markdown",
         )
         .expect("write instructions.md");
@@ -782,7 +834,7 @@ mod tests {
         assert!(context
             .instruction_files
             .iter()
-            .any(|file| file.path.ends_with(".claw/instructions.md")));
+            .any(|file| file.path.ends_with(".claude/instructions.md")));
         assert!(
             render_instruction_files(&context.instruction_files).contains("instruction markdown")
         );
@@ -799,5 +851,128 @@ mod tests {
         assert!(rendered.contains("# Claude instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn discovers_rules_directory_markdown_files() {
+        let root = temp_dir();
+        let rules_dir = root.join(".claude").join("rules");
+        fs::create_dir_all(&rules_dir).expect("create rules dir");
+        fs::write(rules_dir.join("combat.md"), "combat rules").expect("write combat rules");
+        fs::write(rules_dir.join("ui.md"), "ui rules").expect("write ui rules");
+        // Non-markdown files should be ignored.
+        fs::write(rules_dir.join(".gitkeep"), "").expect("write gitkeep");
+        fs::write(rules_dir.join("notes.txt"), "not markdown").expect("write txt file");
+
+        let context = ProjectContext::discover(&root, "2026-04-06").expect("context should load");
+        let contents: Vec<&str> = context
+            .instruction_files
+            .iter()
+            .map(|f| f.content.as_str())
+            .collect();
+
+        // Alphabetical order: combat.md before ui.md
+        assert_eq!(contents, vec!["combat rules", "ui rules"]);
+        // .gitkeep and .txt should NOT be included
+        assert_eq!(context.instruction_files.len(), 2);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rules_files_combined_with_claude_md() {
+        let root = temp_dir();
+        let rules_dir = root.join(".claude").join("rules");
+        fs::create_dir_all(&rules_dir).expect("create rules dir");
+        fs::write(root.join("CLAUDE.md"), "root instructions").expect("write claude md");
+        fs::write(rules_dir.join("domain.md"), "domain rules").expect("write domain rules");
+
+        let context = ProjectContext::discover(&root, "2026-04-06").expect("context should load");
+        let contents: Vec<&str> = context
+            .instruction_files
+            .iter()
+            .map(|f| f.content.as_str())
+            .collect();
+
+        // CLAUDE.md comes first, then rules files
+        assert_eq!(contents, vec!["root instructions", "domain rules"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn skips_large_rules_files() {
+        let root = temp_dir();
+        let rules_dir = root.join(".claude").join("rules");
+        fs::create_dir_all(&rules_dir).expect("create rules dir");
+        // Write a file larger than MAX_RULES_FILE_BYTES (100KB)
+        let huge_content = "x".repeat(200_000);
+        fs::write(rules_dir.join("huge.md"), &huge_content).expect("write huge rules file");
+        fs::write(rules_dir.join("small.md"), "small rules").expect("write small rules file");
+
+        let context = ProjectContext::discover(&root, "2026-04-06").expect("context should load");
+        let contents: Vec<&str> = context
+            .instruction_files
+            .iter()
+            .map(|f| f.content.as_str())
+            .collect();
+
+        // Only the small file should be loaded
+        assert_eq!(contents, vec!["small rules"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rules_discovered_at_ancestor_levels() {
+        let root = temp_dir();
+        let nested = root.join("apps").join("api");
+        fs::create_dir_all(nested.join(".claude").join("rules")).expect("nested rules dir");
+        fs::create_dir_all(root.join(".claude").join("rules")).expect("root rules dir");
+        fs::write(
+            root.join(".claude").join("rules").join("root-rule.md"),
+            "root rule",
+        )
+        .expect("write root rule");
+        fs::write(
+            nested.join(".claude").join("rules").join("nested-rule.md"),
+            "nested rule",
+        )
+        .expect("write nested rule");
+
+        let context = ProjectContext::discover(&nested, "2026-04-06").expect("context should load");
+        let contents: Vec<&str> = context
+            .instruction_files
+            .iter()
+            .map(|f| f.content.as_str())
+            .collect();
+
+        // Root rules first (ancestor), then nested rules
+        assert_eq!(contents, vec!["root rule", "nested rule"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn empty_rules_directory_is_harmless() {
+        let root = temp_dir();
+        let rules_dir = root.join(".claude").join("rules");
+        fs::create_dir_all(&rules_dir).expect("create rules dir");
+
+        let context = ProjectContext::discover(&root, "2026-04-06").expect("context should load");
+        assert!(context.instruction_files.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn missing_rules_directory_is_harmless() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("create root dir");
+
+        let context = ProjectContext::discover(&root, "2026-04-06").expect("context should load");
+        assert!(context.instruction_files.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

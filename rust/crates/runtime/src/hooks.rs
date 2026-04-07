@@ -425,12 +425,22 @@ impl HookRunner {
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
         child.stderr(Stdio::piped());
-        child.env("HOOK_EVENT", event.as_str());
-        child.env("HOOK_TOOL_NAME", tool_name);
-        child.env("HOOK_TOOL_INPUT", tool_input);
-        child.env("HOOK_TOOL_IS_ERROR", if is_error { "1" } else { "0" });
+        child.env("CLAUDE_HOOK_EVENT", event.as_str());
+        child.env("CLAUDE_TOOL_NAME", tool_name);
+        child.env("CLAUDE_TOOL_INPUT", tool_input);
+        child.env("CLAUDE_TOOL_IS_ERROR", if is_error { "1" } else { "0" });
         if let Some(tool_output) = tool_output {
-            child.env("HOOK_TOOL_OUTPUT", tool_output);
+            child.env("CLAUDE_TOOL_OUTPUT", tool_output);
+        }
+        if let Some(tool_error) = tool_output.filter(|_| is_error) {
+            child.env("CLAUDE_TOOL_ERROR", tool_error);
+        }
+
+        // Extract file_path from tool input JSON for Edit/Write hooks
+        if let Ok(parsed) = serde_json::from_str::<Value>(tool_input) {
+            if let Some(file_path) = parsed.get("file_path").and_then(Value::as_str) {
+                child.env("CLAUDE_FILE_PATH", file_path);
+            }
         }
 
         match child.output_with_stdin(payload.as_bytes(), abort_signal) {
