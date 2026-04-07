@@ -8047,6 +8047,50 @@ mod tests {
     }
 
     #[test]
+    fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        let args = vec!["--dangerously-skip-permissions".to_string()];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        assert_eq!(
+            parsed,
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn dangerously_skip_permissions_flag_applies_to_prompt_subcommand() {
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        let args = vec![
+            "--dangerously-skip-permissions".to_string(),
+            "prompt".to_string(),
+            "do".to_string(),
+            "the".to_string(),
+            "thing".to_string(),
+        ];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+
+        assert_eq!(
+            parsed,
+            CliAction::Prompt {
+                prompt: "do the thing".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
