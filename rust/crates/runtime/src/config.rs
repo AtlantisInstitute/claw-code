@@ -929,7 +929,9 @@ fn parse_permission_mode_label(
     match mode {
         "default" | "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
         "acceptEdits" | "auto" | "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
-        "dontAsk" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
+        "dontAsk" | "bypassPermissions" | "danger-full-access" => {
+            Ok(ResolvedPermissionMode::DangerFullAccess)
+        }
         other => Err(ConfigError::Parse(format!(
             "{context}: unsupported permission mode {other}"
         ))),
@@ -1930,6 +1932,11 @@ mod tests {
         );
         assert_eq!(
             parse_permission_mode_label("dontAsk", "test").expect("dontAsk should resolve"),
+            ResolvedPermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            parse_permission_mode_label("bypassPermissions", "test")
+                .expect("bypassPermissions should resolve"),
             ResolvedPermissionMode::DangerFullAccess
         );
     }
