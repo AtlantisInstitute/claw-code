@@ -9,7 +9,11 @@ const STARTER_CLAW_JSON: &str = concat!(
     "}\n",
 );
 const GITIGNORE_COMMENT: &str = "# Claude Code local artifacts";
-const GITIGNORE_ENTRIES: [&str; 2] = [".claude/settings.local.json", ".claude/sessions/"];
+const GITIGNORE_ENTRIES: [&str; 3] = [
+    ".claude/settings.local.json",
+    ".claude/sessions/",
+    ".claude/plans/",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InitStatus {

@@ -11,6 +11,9 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    SubagentStart,
+    PreCompact,
+    Stop,
 }
 
 impl HookEvent {
@@ -19,6 +22,9 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::SubagentStart => "SubagentStart",
+            Self::PreCompact => "PreCompact",
+            Self::Stop => "Stop",
         }
     }
 }
@@ -115,6 +121,22 @@ impl HookRunner {
             tool_input,
             Some(tool_error),
             true,
+        )
+    }
+
+    #[must_use]
+    pub fn run_subagent_start(
+        &self,
+        agent_type: &str,
+        task_description: &str,
+    ) -> HookRunResult {
+        Self::run_commands(
+            HookEvent::SubagentStart,
+            &self.hooks.subagent_start,
+            agent_type,
+            task_description,
+            None,
+            false,
         )
     }
 
@@ -470,6 +492,9 @@ mod tests {
             pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
+            subagent_start: Vec::new(),
+            pre_compact: Vec::new(),
+            stop: Vec::new(),
         });
 
         // when
@@ -490,6 +515,9 @@ mod tests {
             ],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
+            subagent_start: Vec::new(),
+            pre_compact: Vec::new(),
+            stop: Vec::new(),
         });
 
         // when

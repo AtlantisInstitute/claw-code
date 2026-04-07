@@ -60,6 +60,8 @@ pub struct ProjectContext {
     pub git_status: Option<String>,
     pub git_diff: Option<String>,
     pub instruction_files: Vec<ContextFile>,
+    /// The most recent plan file, loaded only when plan mode is active.
+    pub active_plan: Option<ContextFile>,
 }
 
 impl ProjectContext {
@@ -69,12 +71,14 @@ impl ProjectContext {
     ) -> std::io::Result<Self> {
         let cwd = cwd.into();
         let instruction_files = discover_instruction_files(&cwd)?;
+        let active_plan = discover_active_plan(&cwd);
         Ok(Self {
             cwd,
             current_date: current_date.into(),
             git_status: None,
             git_diff: None,
             instruction_files,
+            active_plan,
         })
     }
 
@@ -155,6 +159,9 @@ impl SystemPromptBuilder {
             sections.push(render_project_context(project_context));
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
+            }
+            if let Some(plan) = &project_context.active_plan {
+                sections.push(render_active_plan(plan));
             }
         }
         if let Some(config) = &self.config {
@@ -259,12 +266,12 @@ fn discover_rules_in_dir(files: &mut Vec<ContextFile>, dir: &Path) -> std::io::R
     };
 
     let mut paths: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .filter(|entry| {
             let path = entry.path();
             let is_md = path
                 .extension()
-                .map_or(false, |ext| ext.eq_ignore_ascii_case("md"));
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
             let within_size = entry
                 .metadata()
                 .map(|m| m.len() <= MAX_RULES_FILE_BYTES)
@@ -281,6 +288,75 @@ fn discover_rules_in_dir(files: &mut Vec<ContextFile>, dir: &Path) -> std::io::R
         push_context_file(files, path)?;
     }
     Ok(())
+}
+
+/// Returns the most recent plan file as a [`ContextFile`] when plan mode is
+/// active (i.e. `.claude/tool-state/plan-mode.json` exists with content).
+/// When plan mode is NOT active the plan directory is not scanned at all.
+fn discover_active_plan(cwd: &Path) -> Option<ContextFile> {
+    let plan_mode_state = cwd
+        .join(".claude")
+        .join("tool-state")
+        .join("plan-mode.json");
+    // Only load plan files when plan mode is active.
+    let state_content = fs::read_to_string(&plan_mode_state).ok()?;
+    if state_content.trim().is_empty() {
+        return None;
+    }
+
+    let plans_dir = cwd.join(".claude").join("plans");
+    let entries = fs::read_dir(&plans_dir).ok()?;
+
+    let latest = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((entry.path(), modified))
+        })
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(path, _)| path)?;
+
+    let content = fs::read_to_string(&latest).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    Some(ContextFile {
+        path: latest,
+        content,
+    })
+}
+
+/// Scans `.claude/plans/` and returns all `.md` files sorted by modification
+/// time (most recent first).
+#[must_use]
+pub fn discover_plan_files(dir: &Path) -> Vec<PathBuf> {
+    let plans_dir = dir.join(".claude").join("plans");
+    let Ok(entries) = fs::read_dir(&plans_dir) else {
+        return Vec::new();
+    };
+
+    let mut files: Vec<(PathBuf, std::time::SystemTime)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((entry.path(), modified))
+        })
+        .collect();
+
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.into_iter().map(|(path, _)| path).collect()
 }
 
 fn read_git_status(cwd: &Path) -> Option<String> {
@@ -380,6 +456,12 @@ fn render_instruction_files(files: &[ContextFile]) -> String {
         sections.push(rendered_content);
     }
     sections.join("\n\n")
+}
+
+fn render_active_plan(plan: &ContextFile) -> String {
+    let path = display_context_path(&plan.path);
+    let content = truncate_instruction_content(&plan.content, MAX_INSTRUCTION_FILE_CHARS);
+    format!("# Active plan\n\nPlan file: {path}\n\n{content}")
 }
 
 fn dedupe_instruction_files(files: Vec<ContextFile>) -> Vec<ContextFile> {

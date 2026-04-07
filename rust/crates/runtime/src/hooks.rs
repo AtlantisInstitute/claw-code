@@ -20,6 +20,9 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    SubagentStart,
+    PreCompact,
+    Stop,
 }
 
 impl HookEvent {
@@ -29,6 +32,9 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::SubagentStart => "SubagentStart",
+            Self::PreCompact => "PreCompact",
+            Self::Stop => "Stop",
         }
     }
 }
@@ -304,6 +310,275 @@ impl HookRunner {
             abort_signal,
             None,
         )
+    }
+
+    /// Run hooks registered for the `SubagentStart` event.
+    ///
+    /// Fires when a sub-agent is dispatched, passing agent metadata as
+    /// environment variables (`CLAUDE_SUBAGENT_TYPE`, `CLAUDE_SUBAGENT_TASK`)
+    /// and via the JSON payload on stdin.
+    #[must_use]
+    pub fn run_subagent_start(
+        &self,
+        agent_type: &str,
+        task_description: &str,
+    ) -> HookRunResult {
+        let commands = self.config.subagent_start();
+        if commands.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+
+        let event = HookEvent::SubagentStart;
+        let payload = json!({
+            "hook_event_name": event.as_str(),
+            "agent_type": agent_type,
+            "task_description": task_description,
+        })
+        .to_string();
+
+        let mut result = HookRunResult::allow(Vec::new());
+
+        for command in commands {
+            let mut child = shell_command(command);
+            child.stdin(Stdio::piped());
+            child.stdout(Stdio::piped());
+            child.stderr(Stdio::piped());
+            child.env("CLAUDE_HOOK_EVENT", event.as_str());
+            child.env("CLAUDE_SUBAGENT_TYPE", agent_type);
+            child.env("CLAUDE_SUBAGENT_TASK", task_description);
+
+            match child.output_with_stdin(payload.as_bytes(), None) {
+                Ok(CommandExecution::Finished(output)) => {
+                    let stdout =
+                        String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let parsed = parse_hook_output(&stdout);
+                    match output.status.code() {
+                        Some(0) => {
+                            merge_parsed_hook_output(&mut result, parsed);
+                        }
+                        Some(code) => {
+                            let primary_message =
+                                parsed.primary_message().map(ToOwned::to_owned);
+                            let stderr = String::from_utf8_lossy(&output.stderr)
+                                .trim()
+                                .to_string();
+                            merge_parsed_hook_output(
+                                &mut result,
+                                parsed.with_fallback_message(format_hook_failure(
+                                    command,
+                                    code,
+                                    primary_message.as_deref(),
+                                    stderr.as_str(),
+                                )),
+                            );
+                            result.failed = true;
+                            return result;
+                        }
+                        None => {
+                            result.messages.push(format!(
+                                "{} hook `{command}` terminated by signal",
+                                event.as_str()
+                            ));
+                            result.failed = true;
+                            return result;
+                        }
+                    }
+                }
+                Ok(CommandExecution::Cancelled) => {
+                    result.cancelled = true;
+                    result.messages.push(format!(
+                        "{} hook `{command}` cancelled",
+                        event.as_str()
+                    ));
+                    return result;
+                }
+                Err(error) => {
+                    result.messages.push(format!(
+                        "{} hook `{command}` failed to start: {error}",
+                        event.as_str()
+                    ));
+                    result.failed = true;
+                    return result;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Run hooks registered for the `PreCompact` event.
+    ///
+    /// Fires immediately before context compaction so external scripts can
+    /// save session state (e.g., WIP context to `.claude/session-state/`).
+    /// Sets `CLAUDE_HOOK_EVENT=PreCompact` and provides a minimal JSON
+    /// payload on stdin.  The return value is advisory — compaction
+    /// proceeds regardless of the hook outcome.
+    #[must_use]
+    pub fn run_pre_compact(&self) -> HookRunResult {
+        let commands = self.config.pre_compact();
+        if commands.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+
+        let event = HookEvent::PreCompact;
+        let payload = json!({
+            "hook_event_name": event.as_str(),
+        })
+        .to_string();
+
+        let mut result = HookRunResult::allow(Vec::new());
+
+        for command in commands {
+            let mut child = shell_command(command);
+            child.stdin(Stdio::piped());
+            child.stdout(Stdio::piped());
+            child.stderr(Stdio::piped());
+            child.env("CLAUDE_HOOK_EVENT", event.as_str());
+
+            match child.output_with_stdin(payload.as_bytes(), None) {
+                Ok(CommandExecution::Finished(output)) => {
+                    let stdout =
+                        String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let parsed = parse_hook_output(&stdout);
+                    match output.status.code() {
+                        Some(0) => {
+                            merge_parsed_hook_output(&mut result, parsed);
+                        }
+                        Some(code) => {
+                            let primary_message =
+                                parsed.primary_message().map(ToOwned::to_owned);
+                            let stderr = String::from_utf8_lossy(&output.stderr)
+                                .trim()
+                                .to_string();
+                            merge_parsed_hook_output(
+                                &mut result,
+                                parsed.with_fallback_message(format_hook_failure(
+                                    command,
+                                    code,
+                                    primary_message.as_deref(),
+                                    stderr.as_str(),
+                                )),
+                            );
+                            result.failed = true;
+                            return result;
+                        }
+                        None => {
+                            result.messages.push(format!(
+                                "{} hook `{command}` terminated by signal",
+                                event.as_str()
+                            ));
+                            result.failed = true;
+                            return result;
+                        }
+                    }
+                }
+                Ok(CommandExecution::Cancelled) => {
+                    result.cancelled = true;
+                    result.messages.push(format!(
+                        "{} hook `{command}` cancelled",
+                        event.as_str()
+                    ));
+                    return result;
+                }
+                Err(error) => {
+                    result.messages.push(format!(
+                        "{} hook `{command}` failed to start: {error}",
+                        event.as_str()
+                    ));
+                    result.failed = true;
+                    return result;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Run hooks registered for the `Stop` event.
+    ///
+    /// Fires when the session/conversation ends (REPL exit, prompt completion,
+    /// or resume session end).  Sets `CLAUDE_HOOK_EVENT=Stop` and provides a
+    /// minimal JSON payload on stdin.  The return value is informational only
+    /// — the process exits regardless of hook outcome.
+    #[must_use]
+    pub fn run_stop(&self) -> HookRunResult {
+        let commands = self.config.stop();
+        if commands.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+
+        let event = HookEvent::Stop;
+        let payload = json!({
+            "hook_event_name": event.as_str(),
+        })
+        .to_string();
+
+        let mut result = HookRunResult::allow(Vec::new());
+
+        for command in commands {
+            let mut child = shell_command(command);
+            child.stdin(Stdio::piped());
+            child.stdout(Stdio::piped());
+            child.stderr(Stdio::piped());
+            child.env("CLAUDE_HOOK_EVENT", event.as_str());
+
+            match child.output_with_stdin(payload.as_bytes(), None) {
+                Ok(CommandExecution::Finished(output)) => {
+                    let stdout =
+                        String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let parsed = parse_hook_output(&stdout);
+                    match output.status.code() {
+                        Some(0) => {
+                            merge_parsed_hook_output(&mut result, parsed);
+                        }
+                        Some(code) => {
+                            let primary_message =
+                                parsed.primary_message().map(ToOwned::to_owned);
+                            let stderr = String::from_utf8_lossy(&output.stderr)
+                                .trim()
+                                .to_string();
+                            merge_parsed_hook_output(
+                                &mut result,
+                                parsed.with_fallback_message(format_hook_failure(
+                                    command,
+                                    code,
+                                    primary_message.as_deref(),
+                                    stderr.as_str(),
+                                )),
+                            );
+                            result.failed = true;
+                            return result;
+                        }
+                        None => {
+                            result.messages.push(format!(
+                                "{} hook `{command}` terminated by signal",
+                                event.as_str()
+                            ));
+                            result.failed = true;
+                            return result;
+                        }
+                    }
+                }
+                Ok(CommandExecution::Cancelled) => {
+                    result.cancelled = true;
+                    result.messages.push(format!(
+                        "{} hook `{command}` cancelled",
+                        event.as_str()
+                    ));
+                    return result;
+                }
+                Err(error) => {
+                    result.messages.push(format!(
+                        "{} hook `{command}` failed to start: {error}",
+                        event.as_str()
+                    ));
+                    result.failed = true;
+                    return result;
+                }
+            }
+        }
+
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -750,6 +1025,9 @@ mod tests {
             vec![shell_snippet("printf 'pre ok'")],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         ));
 
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
@@ -761,6 +1039,9 @@ mod tests {
     fn denies_exit_code_two() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet("printf 'blocked by hook'; exit 2")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ));
@@ -776,6 +1057,9 @@ mod tests {
         let runner = HookRunner::from_feature_config(&RuntimeFeatureConfig::default().with_hooks(
             RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'warning hook'; exit 1")],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             ),
@@ -801,6 +1085,9 @@ mod tests {
             )],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         ));
 
         let result = runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#);
@@ -821,6 +1108,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![shell_snippet("printf 'failure hook ran'")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         ));
 
         // when
@@ -842,6 +1132,9 @@ mod tests {
                 shell_snippet("printf 'broken failure hook'; exit 1"),
                 shell_snippet("printf 'later failure hook'"),
             ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         ));
 
         // when
@@ -868,6 +1161,9 @@ mod tests {
                 shell_snippet("printf 'first'"),
                 shell_snippet("printf 'second'"),
             ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ));
@@ -931,6 +1227,9 @@ mod tests {
             ],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         ));
 
         // when
@@ -949,6 +1248,9 @@ mod tests {
     fn abort_signal_cancels_long_running_hook_and_reports_progress() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![shell_snippet("sleep 5")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ));
@@ -983,6 +1285,198 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn subagent_start_hook_runs_and_captures_output() {
+        // given
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![shell_snippet("printf 'agent started'")],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        // when
+        let result = runner.run_subagent_start("general-purpose", "fix the bug");
+
+        // then
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert_eq!(result.messages(), &["agent started".to_string()]);
+    }
+
+    #[test]
+    fn subagent_start_hook_sets_env_vars() {
+        // given — a hook that echoes back the env vars it receives
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![shell_snippet(
+                "printf '{\"systemMessage\":\"type=%s task=%s\"}' \"$CLAUDE_SUBAGENT_TYPE\" \"$CLAUDE_SUBAGENT_TASK\"",
+            )],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        // when
+        let result = runner.run_subagent_start("explore", "read the file");
+
+        // then
+        assert!(!result.is_failed());
+        assert!(result
+            .messages()
+            .iter()
+            .any(|msg| msg.contains("type=explore") && msg.contains("task=read the file")));
+    }
+
+    #[test]
+    fn subagent_start_noop_when_no_hooks_configured() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_subagent_start("general-purpose", "some task");
+
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert!(result.messages().is_empty());
+    }
+
+    #[test]
+    fn pre_compact_hook_runs_and_captures_output() {
+        // given
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![shell_snippet("printf 'compact hook ran'")],
+            Vec::new(),
+        ));
+
+        // when
+        let result = runner.run_pre_compact();
+
+        // then
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert_eq!(result.messages(), &["compact hook ran".to_string()]);
+    }
+
+    #[test]
+    fn pre_compact_hook_sets_env_var() {
+        // given — a hook that echoes back the CLAUDE_HOOK_EVENT env var
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![shell_snippet(
+                "printf '{\"systemMessage\":\"event=%s\"}' \"$CLAUDE_HOOK_EVENT\"",
+            )],
+            Vec::new(),
+        ));
+
+        // when
+        let result = runner.run_pre_compact();
+
+        // then
+        assert!(!result.is_failed());
+        assert!(result
+            .messages()
+            .iter()
+            .any(|msg| msg.contains("event=PreCompact")));
+    }
+
+    #[test]
+    fn pre_compact_noop_when_no_hooks_configured() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_compact();
+
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert!(result.messages().is_empty());
+    }
+
+    #[test]
+    fn stop_hook_runs_and_captures_output() {
+        // given
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![shell_snippet("printf 'stop hook ran'")],
+        ));
+
+        // when
+        let result = runner.run_stop();
+
+        // then
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert_eq!(result.messages(), &["stop hook ran".to_string()]);
+    }
+
+    #[test]
+    fn stop_hook_sets_env_var() {
+        // given — a hook that echoes back the CLAUDE_HOOK_EVENT env var
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![shell_snippet(
+                "printf '{\"systemMessage\":\"event=%s\"}' \"$CLAUDE_HOOK_EVENT\"",
+            )],
+        ));
+
+        // when
+        let result = runner.run_stop();
+
+        // then
+        assert!(!result.is_failed());
+        assert!(result
+            .messages()
+            .iter()
+            .any(|msg| msg.contains("event=Stop")));
+    }
+
+    #[test]
+    fn stop_noop_when_no_hooks_configured() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_stop();
+
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert!(result.messages().is_empty());
     }
 
     #[cfg(windows)]

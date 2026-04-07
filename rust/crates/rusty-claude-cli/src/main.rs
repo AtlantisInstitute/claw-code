@@ -172,6 +172,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             LiveCli::new_with_options(model, true, allowed_tools, permission_mode, max_turns)?
                 .run_turn_with_output(&prompt, output_format)?;
+            // Fire Stop hook after the single-prompt session completes.
+            if let Some(hook_runner) = tools::try_global_hook_runner() {
+                let _ = hook_runner.run_stop();
+            }
         }
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
@@ -1970,6 +1974,13 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             }
         }
     }
+
+    // Fire Stop hook after the resume session completes.
+    // The global hook runner may not be initialised in the lightweight
+    // resume path, so this is best-effort.
+    if let Some(hook_runner) = tools::try_global_hook_runner() {
+        let _ = hook_runner.run_stop();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2318,6 +2329,12 @@ fn run_resume_command(
             json: None,
         }),
         SlashCommand::Compact => {
+            // Fire PreCompact hook so external scripts can save session state.
+            // The global hook runner may not be initialised in the lightweight
+            // resume path, so this is best-effort.
+            if let Some(hook_runner) = tools::try_global_hook_runner() {
+                let _ = hook_runner.run_pre_compact();
+            }
             let result = runtime::compact_session(
                 session,
                 CompactionConfig {
@@ -2596,6 +2613,11 @@ fn run_repl(
                 break;
             }
         }
+    }
+
+    // Fire Stop hook after the REPL loop exits (clean exit only).
+    if let Some(hook_runner) = tools::try_global_hook_runner() {
+        let _ = hook_runner.run_stop();
     }
 
     Ok(())
@@ -5158,10 +5180,14 @@ fn build_runtime_plugin_state_with_loader(
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
         runtime_hook_config_from_plugin_hooks(plugin_registry.aggregated_hooks()?);
+    let merged_hooks = runtime_config.hooks().merged(&plugin_hook_config);
+    // Expose the merged hook config to the tools crate so that SubagentStart
+    // hooks fire when sub-agents are spawned (tools lack a threaded context).
+    tools::set_global_hook_runner(runtime::HookRunner::new(merged_hooks.clone()));
     let feature_config = runtime_config
         .feature_config()
         .clone()
-        .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
+        .with_hooks(merged_hooks);
     let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
     let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
         .with_runtime_tools(runtime_tools)?;
@@ -5214,6 +5240,9 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
         hooks.pre_tool_use,
         hooks.post_tool_use,
         hooks.post_tool_use_failure,
+        hooks.subagent_start,
+        hooks.pre_compact,
+        hooks.stop,
     )
 }
 

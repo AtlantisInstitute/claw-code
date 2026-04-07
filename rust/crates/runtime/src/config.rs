@@ -70,6 +70,9 @@ pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
     post_tool_use_failure: Vec<String>,
+    subagent_start: Vec<String>,
+    pre_compact: Vec<String>,
+    stop: Vec<String>,
 }
 
 /// Raw permission rule lists grouped by allow, deny, and ask behavior.
@@ -503,11 +506,17 @@ impl RuntimeHookConfig {
         pre_tool_use: Vec<String>,
         post_tool_use: Vec<String>,
         post_tool_use_failure: Vec<String>,
+        subagent_start: Vec<String>,
+        pre_compact: Vec<String>,
+        stop: Vec<String>,
     ) -> Self {
         Self {
             pre_tool_use,
             post_tool_use,
             post_tool_use_failure,
+            subagent_start,
+            pre_compact,
+            stop,
         }
     }
 
@@ -535,11 +544,29 @@ impl RuntimeHookConfig {
             &mut self.post_tool_use_failure,
             other.post_tool_use_failure(),
         );
+        extend_unique(&mut self.subagent_start, other.subagent_start());
+        extend_unique(&mut self.pre_compact, other.pre_compact());
+        extend_unique(&mut self.stop, other.stop());
     }
 
     #[must_use]
     pub fn post_tool_use_failure(&self) -> &[String] {
         &self.post_tool_use_failure
+    }
+
+    #[must_use]
+    pub fn subagent_start(&self) -> &[String] {
+        &self.subagent_start
+    }
+
+    #[must_use]
+    pub fn pre_compact(&self) -> &[String] {
+        &self.pre_compact
+    }
+
+    #[must_use]
+    pub fn stop(&self) -> &[String] {
+        &self.stop
     }
 }
 
@@ -683,6 +710,10 @@ fn parse_optional_hooks_config_object(
         post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
         post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
             .unwrap_or_default(),
+        subagent_start: optional_string_array(hooks, "SubagentStart", context)?
+            .unwrap_or_default(),
+        pre_compact: optional_string_array(hooks, "PreCompact", context)?.unwrap_or_default(),
+        stop: optional_string_array(hooks, "Stop", context)?.unwrap_or_default(),
     })
 }
 
@@ -1642,11 +1673,17 @@ mod tests {
             vec!["pre-a".to_string()],
             vec!["post-a".to_string()],
             vec!["failure-a".to_string()],
+            vec!["subagent-a".to_string()],
+            vec!["compact-a".to_string()],
+            vec!["stop-a".to_string()],
         );
         let overlay = RuntimeHookConfig::new(
             vec!["pre-a".to_string(), "pre-b".to_string()],
             vec!["post-a".to_string(), "post-b".to_string()],
             vec!["failure-b".to_string()],
+            vec!["subagent-a".to_string(), "subagent-b".to_string()],
+            vec!["compact-a".to_string(), "compact-b".to_string()],
+            vec!["stop-a".to_string(), "stop-b".to_string()],
         );
 
         // when
@@ -1664,6 +1701,18 @@ mod tests {
         assert_eq!(
             merged.post_tool_use_failure(),
             &["failure-a".to_string(), "failure-b".to_string()]
+        );
+        assert_eq!(
+            merged.subagent_start(),
+            &["subagent-a".to_string(), "subagent-b".to_string()]
+        );
+        assert_eq!(
+            merged.pre_compact(),
+            &["compact-a".to_string(), "compact-b".to_string()]
+        );
+        assert_eq!(
+            merged.stop(),
+            &["stop-a".to_string(), "stop-b".to_string()]
         );
     }
 

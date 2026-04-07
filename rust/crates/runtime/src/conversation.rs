@@ -486,6 +486,7 @@ where
 
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
+        let _ = self.hook_runner.run_pre_compact();
         compact_session(&self.session, config)
     }
 
@@ -520,6 +521,8 @@ where
         {
             return None;
         }
+
+        let _ = self.hook_runner.run_pre_compact();
 
         let result = compact_session(
             &self.session,
@@ -891,6 +894,7 @@ mod tests {
                 git_status: None,
                 git_diff: None,
                 instruction_files: Vec::new(),
+                active_plan: None,
             })
             .with_os("linux", "6.8")
             .build();
@@ -1051,6 +1055,9 @@ mod tests {
                 vec![shell_snippet("printf 'blocked by hook'; exit 2")],
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             )),
         );
 
@@ -1112,6 +1119,9 @@ mod tests {
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'broken hook'; exit 1")],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )),
@@ -1182,6 +1192,9 @@ mod tests {
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'pre hook ran'")],
                 vec![shell_snippet("printf 'post hook ran'")],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
             )),
         );
@@ -1260,6 +1273,9 @@ mod tests {
                 Vec::new(),
                 vec![shell_snippet("printf 'post hook should not run'")],
                 vec![shell_snippet("printf 'failure hook ran'")],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             )),
         );
 

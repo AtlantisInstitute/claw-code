@@ -69,6 +69,12 @@ pub struct PluginHooks {
     pub post_tool_use: Vec<String>,
     #[serde(rename = "PostToolUseFailure", default)]
     pub post_tool_use_failure: Vec<String>,
+    #[serde(rename = "SubagentStart", default)]
+    pub subagent_start: Vec<String>,
+    #[serde(rename = "PreCompact", default)]
+    pub pre_compact: Vec<String>,
+    #[serde(rename = "Stop", default)]
+    pub stop: Vec<String>,
 }
 
 impl PluginHooks {
@@ -77,6 +83,9 @@ impl PluginHooks {
         self.pre_tool_use.is_empty()
             && self.post_tool_use.is_empty()
             && self.post_tool_use_failure.is_empty()
+            && self.subagent_start.is_empty()
+            && self.pre_compact.is_empty()
+            && self.stop.is_empty()
     }
 
     #[must_use]
@@ -91,6 +100,13 @@ impl PluginHooks {
         merged
             .post_tool_use_failure
             .extend(other.post_tool_use_failure.iter().cloned());
+        merged
+            .subagent_start
+            .extend(other.subagent_start.iter().cloned());
+        merged
+            .pre_compact
+            .extend(other.pre_compact.iter().cloned());
+        merged.stop.extend(other.stop.iter().cloned());
         merged
     }
 }
@@ -1791,11 +1807,11 @@ fn detect_claude_code_manifest_contract_gaps(
         for hook_name in hooks.keys() {
             if !matches!(
                 hook_name.as_str(),
-                "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+                "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "SubagentStart" | "PreCompact" | "Stop"
             ) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claude` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claude` plugins currently support only PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, PreCompact, and Stop."
                     ),
                 });
             }
@@ -1839,6 +1855,24 @@ fn build_plugin_manifest(
     validate_command_entries(
         root,
         raw.hooks.post_tool_use_failure.iter(),
+        "hook",
+        &mut errors,
+    );
+    validate_command_entries(
+        root,
+        raw.hooks.subagent_start.iter(),
+        "hook",
+        &mut errors,
+    );
+    validate_command_entries(
+        root,
+        raw.hooks.pre_compact.iter(),
+        "hook",
+        &mut errors,
+    );
+    validate_command_entries(
+        root,
+        raw.hooks.stop.iter(),
         "hook",
         &mut errors,
     );
@@ -2091,6 +2125,21 @@ fn resolve_hooks(root: &Path, hooks: &PluginHooks) -> PluginHooks {
             .iter()
             .map(|entry| resolve_hook_entry(root, entry))
             .collect(),
+        subagent_start: hooks
+            .subagent_start
+            .iter()
+            .map(|entry| resolve_hook_entry(root, entry))
+            .collect(),
+        pre_compact: hooks
+            .pre_compact
+            .iter()
+            .map(|entry| resolve_hook_entry(root, entry))
+            .collect(),
+        stop: hooks
+            .stop
+            .iter()
+            .map(|entry| resolve_hook_entry(root, entry))
+            .collect(),
     }
 }
 
@@ -2144,6 +2193,9 @@ fn validate_hook_paths(root: Option<&Path>, hooks: &PluginHooks) -> Result<(), P
         .iter()
         .chain(hooks.post_tool_use.iter())
         .chain(hooks.post_tool_use_failure.iter())
+        .chain(hooks.subagent_start.iter())
+        .chain(hooks.pre_compact.iter())
+        .chain(hooks.stop.iter())
     {
         validate_command_path(root, entry, "hook")?;
     }

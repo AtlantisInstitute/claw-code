@@ -67,6 +67,32 @@ fn global_worker_registry() -> &'static WorkerRegistry {
     REGISTRY.get_or_init(WorkerRegistry::new)
 }
 
+/// Global hook runner used to fire lifecycle hooks (e.g., `SubagentStart`) from
+/// tool execution paths that lack a threaded context object.
+///
+/// Initialised once via [`set_global_hook_runner`]; subsequent reads via
+/// [`global_hook_runner`] return a shared reference.
+mod global_hooks {
+    use runtime::HookRunner;
+    use std::sync::OnceLock;
+
+    static HOOK_RUNNER: OnceLock<HookRunner> = OnceLock::new();
+
+    /// Register the session-wide [`HookRunner`].  Ignored if already set.
+    pub fn set_global_hook_runner(runner: HookRunner) {
+        let _ = HOOK_RUNNER.set(runner);
+    }
+
+    /// Returns the session-wide [`HookRunner`], if one has been registered.
+    pub fn global_hook_runner() -> Option<&'static HookRunner> {
+        HOOK_RUNNER.get()
+    }
+}
+
+pub use global_hooks::set_global_hook_runner;
+pub use global_hooks::global_hook_runner as try_global_hook_runner;
+use global_hooks::global_hook_runner;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
     pub name: String,
@@ -677,10 +703,15 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ExitPlanMode",
-            description: "Restore or clear the worktree-local planning mode override created by EnterPlanMode.",
+            description: "Restore or clear the worktree-local planning mode override created by EnterPlanMode. Optionally saves a plan file to .claude/plans/.",
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "plan_content": {
+                        "type": "string",
+                        "description": "Optional markdown content for the plan. When provided, a plan file is written to .claude/plans/<timestamp>.md."
+                    }
+                },
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -2144,7 +2175,9 @@ struct EnterPlanModeInput {}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct ExitPlanModeInput {}
+struct ExitPlanModeInput {
+    plan_content: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -2466,6 +2499,8 @@ struct PlanModeOutput {
     previous_local_mode: Option<Value>,
     #[serde(rename = "currentLocalMode")]
     current_local_mode: Option<Value>,
+    #[serde(rename = "planFilePath", skip_serializing_if = "Option::is_none")]
+    plan_file_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3306,6 +3341,15 @@ where
     write_agent_manifest(&manifest)?;
 
     let manifest_for_spawn = manifest.clone();
+    // Fire SubagentStart hook before spawning the agent thread.
+    if let Some(hook_runner) = global_hook_runner() {
+        let subagent_type = manifest
+            .subagent_type
+            .as_deref()
+            .unwrap_or("unknown");
+        let _ = hook_runner.run_subagent_start(subagent_type, &manifest.description);
+    }
+
     let job = AgentJob {
         manifest: manifest_for_spawn,
         prompt: input.prompt,
@@ -4487,6 +4531,7 @@ fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput,
                 state_path: state_path.display().to_string(),
                 previous_local_mode: state.previous_local_mode,
                 current_local_mode,
+                plan_file_path: None,
             });
         }
         clear_plan_mode_state(&state_path)?;
@@ -4506,6 +4551,7 @@ fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput,
             state_path: state_path.display().to_string(),
             previous_local_mode: None,
             current_local_mode,
+            plan_file_path: None,
         });
     }
 
@@ -4532,16 +4578,28 @@ fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput,
         state_path: state_path.display().to_string(),
         previous_local_mode: state.previous_local_mode,
         current_local_mode: get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned(),
+        plan_file_path: None,
     })
 }
 
-fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, String> {
+fn execute_exit_plan_mode(input: ExitPlanModeInput) -> Result<PlanModeOutput, String> {
     let settings_path = config_file_for_scope(ConfigScope::Settings)?;
     let state_path = plan_mode_state_file()?;
     let mut document = read_json_object(&settings_path)?;
     let current_local_mode = get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned();
     let current_is_plan =
         matches!(current_local_mode.as_ref(), Some(Value::String(value)) if value == "plan");
+
+    // Write plan file if content was provided.
+    let plan_file_path = if let Some(content) = &input.plan_content {
+        if !content.trim().is_empty() {
+            Some(write_plan_file(content)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let Some(state) = read_plan_mode_state(&state_path)? else {
         return Ok(PlanModeOutput {
@@ -4555,6 +4613,7 @@ fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, S
             state_path: state_path.display().to_string(),
             previous_local_mode: None,
             current_local_mode,
+            plan_file_path,
         });
     };
 
@@ -4573,6 +4632,7 @@ fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, S
             state_path: state_path.display().to_string(),
             previous_local_mode: state.previous_local_mode,
             current_local_mode,
+            plan_file_path,
         });
     }
 
@@ -4592,17 +4652,23 @@ fn execute_exit_plan_mode(_input: ExitPlanModeInput) -> Result<PlanModeOutput, S
     write_json_object(&settings_path, &document)?;
     clear_plan_mode_state(&state_path)?;
 
+    let mut message = String::from("Restored the prior worktree-local plan mode setting.");
+    if let Some(ref path) = plan_file_path {
+        message.push_str(&format!(" Plan saved to {path}."));
+    }
+
     Ok(PlanModeOutput {
         success: true,
         operation: String::from("exit"),
         changed: true,
         active: false,
         managed: false,
-        message: String::from("Restored the prior worktree-local plan mode setting."),
+        message,
         settings_path: settings_path.display().to_string(),
         state_path: state_path.display().to_string(),
         previous_local_mode: state.previous_local_mode,
         current_local_mode: get_nested_value(&document, PERMISSION_DEFAULT_MODE_PATH).cloned(),
+        plan_file_path,
     })
 }
 
@@ -4997,6 +5063,82 @@ fn clear_plan_mode_state(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Returns the `.claude/plans/` directory under the current working directory.
+fn plans_directory() -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok(cwd.join(".claude").join("plans"))
+}
+
+/// Generates a compact timestamp string suitable for plan filenames
+/// (e.g. `2026-04-06_143052`).
+fn plan_file_timestamp() -> String {
+    if let Ok(output) = Command::new("date")
+        .args(["-u", "+%Y-%m-%d_%H%M%S"])
+        .output()
+    {
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+    }
+    // Fallback: epoch seconds.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{secs}")
+}
+
+/// Writes plan content to `.claude/plans/<timestamp>.md` and returns the
+/// absolute path of the created file.  Creates the directory on demand.
+fn write_plan_file(content: &str) -> Result<String, String> {
+    let plans_dir = plans_directory()?;
+    std::fs::create_dir_all(&plans_dir).map_err(|error| error.to_string())?;
+
+    let timestamp = plan_file_timestamp();
+    let file_name = format!("{timestamp}.md");
+    let plan_path = plans_dir.join(&file_name);
+
+    // If a file with this exact name already exists (sub-second collision),
+    // append a numeric suffix to avoid overwriting.
+    let final_path = if plan_path.exists() {
+        let mut suffix = 1u32;
+        loop {
+            let candidate = plans_dir.join(format!("{timestamp}_{suffix}.md"));
+            if !candidate.exists() {
+                break candidate;
+            }
+            suffix += 1;
+        }
+    } else {
+        plan_path
+    };
+
+    std::fs::write(&final_path, content).map_err(|error| error.to_string())?;
+    Ok(final_path.display().to_string())
+}
+
+/// Finds the most recently modified `.md` file in `.claude/plans/`.
+/// Returns `None` if the directory is missing or empty.
+pub fn discover_latest_plan_file(cwd: &Path) -> Option<PathBuf> {
+    let plans_dir = cwd.join(".claude").join("plans");
+    let entries = std::fs::read_dir(&plans_dir).ok()?;
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map_or(false, |ext| ext.eq_ignore_ascii_case("md"))
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((entry.path(), modified))
+        })
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(path, _)| path)
 }
 
 fn iso8601_timestamp() -> String {
