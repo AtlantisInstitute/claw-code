@@ -742,6 +742,9 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
         .map(|block| match block {
             ToolResultContentBlock::Text { text } => text.clone(),
             ToolResultContentBlock::Json { value } => value.to_string(),
+            ToolResultContentBlock::Image { source } => {
+                format!("[image: {} ({} bytes base64)]", source.media_type, source.data.len())
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1008,6 +1011,7 @@ mod tests {
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
                 stream: false,
+                thinking: None,
             },
             OpenAiCompatConfig::xai(),
         );
@@ -1030,6 +1034,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+                thinking: None,
             },
             OpenAiCompatConfig::openai(),
         );
@@ -1048,6 +1053,7 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: true,
+                thinking: None,
             },
             OpenAiCompatConfig::xai(),
         );

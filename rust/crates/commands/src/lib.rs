@@ -321,8 +321,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "usage",
         aliases: &[],
-        summary: "Show detailed API usage statistics",
-        argument_hint: None,
+        summary: "Show detailed API usage statistics or generate HTML report",
+        argument_hint: Some("[report]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1046,6 +1046,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
+    SlashCommandSpec {
+        name: "feature-flags",
+        aliases: &["ff"],
+        summary: "List all feature gates and their values",
+        argument_hint: None,
+        resume_supported: true,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1188,6 +1195,7 @@ pub enum SlashCommand {
     AddDir {
         path: Option<String>,
     },
+    FeatureFlags,
     Unknown(String),
 }
 
@@ -1421,6 +1429,10 @@ pub fn validate_slash_command_input(
         "tag" => SlashCommand::Tag { label: remainder },
         "output-style" => SlashCommand::OutputStyle { style: remainder },
         "add-dir" => SlashCommand::AddDir { path: remainder },
+        "feature-flags" | "ff" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::FeatureFlags
+        }
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -4003,7 +4015,7 @@ pub fn handle_slash_command(
 
     match command {
         SlashCommand::Compact => {
-            let result = compact_session(session, compaction);
+            let result = compact_session(session, compaction, None);
             let message = if result.removed_message_count == 0 {
                 "Compaction skipped: session is below the compaction threshold.".to_string()
             } else {
@@ -4086,6 +4098,7 @@ pub fn handle_slash_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::FeatureFlags
         | SlashCommand::Unknown(_) => None,
     }
 }

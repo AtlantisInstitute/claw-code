@@ -88,6 +88,8 @@ pub struct Session {
     pub compaction: Option<SessionCompaction>,
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
+    pub name: Option<String>,
+    pub linked_pr: Option<String>,
     persistence: Option<SessionPersistence>,
 }
 
@@ -101,6 +103,8 @@ impl PartialEq for Session {
             && self.compaction == other.compaction
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
+            && self.name == other.name
+            && self.linked_pr == other.linked_pr
     }
 }
 
@@ -151,6 +155,8 @@ impl Session {
             compaction: None,
             fork: None,
             workspace_root: None,
+            name: None,
+            linked_pr: None,
             persistence: None,
         }
     }
@@ -169,6 +175,20 @@ impl Session {
     #[must_use]
     pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
         self.workspace_root = Some(workspace_root.into());
+        self
+    }
+
+    /// Assign a human-readable name to this session.
+    #[must_use]
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// Link this session to a GitHub pull request URL.
+    #[must_use]
+    pub fn with_linked_pr(mut self, pr: String) -> Self {
+        self.linked_pr = Some(pr);
         self
     }
 
@@ -252,6 +272,8 @@ impl Session {
                 branch_name: normalize_optional_string(branch_name),
             }),
             workspace_root: self.workspace_root.clone(),
+            name: self.name.as_ref().map(|n| format!("{n} (fork)")),
+            linked_pr: self.linked_pr.clone(),
             persistence: None,
         }
     }
@@ -293,6 +315,15 @@ impl Session {
             object.insert(
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
+            );
+        }
+        if let Some(ref name) = self.name {
+            object.insert("name".to_string(), JsonValue::String(name.clone()));
+        }
+        if let Some(ref linked_pr) = self.linked_pr {
+            object.insert(
+                "linked_pr".to_string(),
+                JsonValue::String(linked_pr.clone()),
             );
         }
         Ok(JsonValue::Object(object))
@@ -339,6 +370,14 @@ impl Session {
             .get("workspace_root")
             .and_then(JsonValue::as_str)
             .map(PathBuf::from);
+        let name = object
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .map(String::from);
+        let linked_pr = object
+            .get("linked_pr")
+            .and_then(JsonValue::as_str)
+            .map(String::from);
         Ok(Self {
             version,
             session_id,
@@ -348,6 +387,8 @@ impl Session {
             compaction,
             fork,
             workspace_root,
+            name,
+            linked_pr,
             persistence: None,
         })
     }
@@ -361,6 +402,8 @@ impl Session {
         let mut compaction = None;
         let mut fork = None;
         let mut workspace_root = None;
+        let mut name = None;
+        let mut linked_pr = None;
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -399,6 +442,14 @@ impl Session {
                         .get("workspace_root")
                         .and_then(JsonValue::as_str)
                         .map(PathBuf::from);
+                    name = object
+                        .get("name")
+                        .and_then(JsonValue::as_str)
+                        .map(String::from);
+                    linked_pr = object
+                        .get("linked_pr")
+                        .and_then(JsonValue::as_str)
+                        .map(String::from);
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -433,6 +484,8 @@ impl Session {
             compaction,
             fork,
             workspace_root,
+            name,
+            linked_pr,
             persistence: None,
         })
     }
@@ -497,6 +550,15 @@ impl Session {
             object.insert(
                 "workspace_root".to_string(),
                 JsonValue::String(workspace_root_to_string(workspace_root)?),
+            );
+        }
+        if let Some(ref name) = self.name {
+            object.insert("name".to_string(), JsonValue::String(name.clone()));
+        }
+        if let Some(ref linked_pr) = self.linked_pr {
+            object.insert(
+                "linked_pr".to_string(),
+                JsonValue::String(linked_pr.clone()),
             );
         }
         Ok(JsonValue::Object(object))
@@ -1286,6 +1348,88 @@ mod tests {
         // then
         assert_eq!(restored.workspace_root(), Some(workspace_root.as_path()));
         assert_eq!(forked.workspace_root(), Some(workspace_root.as_path()));
+    }
+
+    #[test]
+    fn test_session_name_round_trip() {
+        let path = temp_session_path("name-rt");
+        let session = Session::new().with_name("my cool session".to_string());
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.name, Some("my cool session".to_string()));
+    }
+
+    #[test]
+    fn test_session_linked_pr_round_trip() {
+        let path = temp_session_path("pr-rt");
+        let session =
+            Session::new().with_linked_pr("https://github.com/org/repo/pull/42".to_string());
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(
+            restored.linked_pr,
+            Some("https://github.com/org/repo/pull/42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_session_fork_carries_name() {
+        let session = Session::new()
+            .with_name("investigation".to_string())
+            .with_linked_pr("https://github.com/org/repo/pull/7".to_string());
+        let forked = session.fork(Some("branch-a".to_string()));
+
+        assert_eq!(forked.name, Some("investigation (fork)".to_string()));
+        assert_eq!(
+            forked.linked_pr,
+            Some("https://github.com/org/repo/pull/7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_session_name_in_jsonl() {
+        let path = temp_session_path("name-jsonl");
+        let mut session = Session::new().with_name("jsonl-test".to_string());
+        session
+            .push_user_text("hello")
+            .expect("user message should append");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.name, Some("jsonl-test".to_string()));
+        assert_eq!(restored.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_session_name_absent_when_not_set() {
+        let session = Session::new();
+        assert_eq!(session.name, None);
+        assert_eq!(session.linked_pr, None);
+
+        let json = session.to_json().expect("to_json should succeed");
+        let object = json.as_object().expect("should be object");
+        assert!(!object.contains_key("name"));
+        assert!(!object.contains_key("linked_pr"));
+    }
+
+    #[test]
+    fn test_session_name_json_round_trip() {
+        let session = Session::new()
+            .with_name("json-rt".to_string())
+            .with_linked_pr("https://github.com/org/repo/pull/99".to_string());
+        let json = session.to_json().expect("to_json should succeed");
+        let restored = Session::from_json(&json).expect("from_json should succeed");
+
+        assert_eq!(restored.name, Some("json-rt".to_string()));
+        assert_eq!(
+            restored.linked_pr,
+            Some("https://github.com/org/repo/pull/99".to_string())
+        );
     }
 
     fn temp_session_path(label: &str) -> PathBuf {

@@ -5,7 +5,8 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session, estimate_session_tokens, llm_summarize_messages, CompactionConfig,
+    CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -13,7 +14,7 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
-use crate::usage::{TokenUsage, UsageTracker};
+use crate::usage::{BudgetExceeded, TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -106,7 +107,7 @@ impl Display for RuntimeError {
 impl std::error::Error for RuntimeError {}
 
 /// Summary of one completed runtime turn, including tool results and usage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnSummary {
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
@@ -114,6 +115,7 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    pub budget_exceeded: Option<BudgetExceeded>,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -130,6 +132,7 @@ pub struct ConversationRuntime<C, T> {
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
     max_iterations: usize,
+    max_budget_usd: Option<f64>,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
@@ -179,6 +182,7 @@ where
             permission_policy,
             system_prompt,
             max_iterations: usize::MAX,
+            max_budget_usd: None,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
@@ -191,6 +195,12 @@ where
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_budget_usd(mut self, budget: f64) -> Self {
+        self.max_budget_usd = Some(budget);
         self
     }
 
@@ -308,6 +318,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut budget_exceeded: Option<BudgetExceeded> = None;
 
         loop {
             iterations += 1;
@@ -341,7 +352,31 @@ where
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
+
+            // Collect cache events before the budget check so they aren't
+            // lost when the budget-exceeding iteration breaks out of the loop.
             prompt_cache_events.extend(turn_prompt_cache_events);
+
+            // Check budget after recording usage for this iteration.
+            if let Some(budget) = self.max_budget_usd {
+                let cost = self
+                    .usage_tracker
+                    .cumulative_usage()
+                    .estimate_cost_usd()
+                    .total_cost_usd();
+                if cost >= budget {
+                    budget_exceeded = Some(BudgetExceeded {
+                        budget_usd: budget,
+                        spent_usd: cost,
+                    });
+                    // Still record this assistant message, then break.
+                    self.session
+                        .push_message(assistant_message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    assistant_messages.push(assistant_message);
+                    break;
+                }
+            }
             let pending_tool_uses = assistant_message
                 .blocks
                 .iter()
@@ -478,16 +513,21 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            budget_exceeded,
         };
         self.record_turn_completed(&summary);
 
         Ok(summary)
     }
 
-    #[must_use]
-    pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
+    pub fn compact(&mut self, config: CompactionConfig) -> CompactionResult {
         let _ = self.hook_runner.run_pre_compact();
-        compact_session(&self.session, config)
+
+        // Attempt LLM-powered summarization of the messages that will be compacted
+        // (everything except the preserved tail). Falls back to heuristic on failure.
+        let llm_summary =
+            Self::try_llm_summarize(&self.session, &config, &mut self.api_client);
+        compact_session(&self.session, config, llm_summary.as_deref())
     }
 
     #[must_use]
@@ -524,12 +564,15 @@ where
 
         let _ = self.hook_runner.run_pre_compact();
 
+        // Auto-compaction uses the fast heuristic summarizer (not LLM) to avoid
+        // adding an extra API round-trip mid-turn in the tool loop.
         let result = compact_session(
             &self.session,
             CompactionConfig {
                 max_estimated_tokens: 0,
                 ..CompactionConfig::default()
             },
+            None,
         );
 
         if result.removed_message_count == 0 {
@@ -540,6 +583,19 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    /// Attempt LLM summarization of the messages that would be compacted.
+    /// Returns `None` if the session is too small or the LLM call fails.
+    fn try_llm_summarize(
+        session: &Session,
+        _config: &CompactionConfig,
+        api_client: &mut C,
+    ) -> Option<String> {
+        if session.messages.is_empty() {
+            return None;
+        }
+        llm_summarize_messages(&session.messages, api_client)
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -1353,23 +1409,33 @@ mod tests {
     }
 
     #[test]
-    fn compacts_session_after_turns() {
-        struct SimpleApi;
-        impl ApiClient for SimpleApi {
+    fn compacts_session_after_turns_with_llm_fallback() {
+        /// API client that succeeds for turns but fails for LLM summarization.
+        struct FallbackApi;
+        impl ApiClient for FallbackApi {
             fn stream(
                 &mut self,
-                _request: ApiRequest,
+                request: ApiRequest,
             ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-                Ok(vec![
-                    AssistantEvent::TextDelta("done".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
+                // LLM summarization sends a system prompt containing "summarizer"
+                let is_summarization = request
+                    .system_prompt
+                    .iter()
+                    .any(|s| s.contains("summarizer"));
+                if is_summarization {
+                    Err(RuntimeError::new("simulated LLM failure"))
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
             }
         }
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
-            SimpleApi,
+            FallbackApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
@@ -1382,6 +1448,7 @@ mod tests {
             preserve_recent_messages: 2,
             max_estimated_tokens: 1,
         });
+        // Falls back to heuristic → contains structured summary
         assert!(result.summary.contains("Conversation summary"));
         assert_eq!(
             result.compacted_session.messages[0].role,
@@ -1390,6 +1457,63 @@ mod tests {
         assert_eq!(
             result.compacted_session.session_id,
             runtime.session().session_id
+        );
+        assert!(result.compacted_session.compaction.is_some());
+    }
+
+    #[test]
+    fn compacts_session_with_llm_summary() {
+        /// API client that provides an LLM summary for compaction.
+        struct LlmApi {
+            call_count: usize,
+        }
+        impl ApiClient for LlmApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                let is_summarization = request
+                    .system_prompt
+                    .iter()
+                    .any(|s| s.contains("summarizer"));
+                if is_summarization {
+                    Ok(vec![
+                        AssistantEvent::TextDelta(
+                            "User worked on tasks a, b, c. Key decision: use LLM summaries."
+                                .to_string(),
+                        ),
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LlmApi { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        runtime.run_turn("a", None).expect("turn a");
+        runtime.run_turn("b", None).expect("turn b");
+        runtime.run_turn("c", None).expect("turn c");
+
+        let result = runtime.compact(CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 1,
+        });
+        // LLM summary should be used
+        assert!(result.summary.contains("use LLM summaries"));
+        assert_eq!(
+            result.compacted_session.messages[0].role,
+            MessageRole::System
         );
         assert!(result.compacted_session.compaction.is_some());
     }
@@ -1702,5 +1826,195 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn with_max_budget_usd_sets_the_field() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_budget_usd(5.0);
+
+        assert!(runtime.max_budget_usd.is_some());
+        assert!((runtime.max_budget_usd.unwrap() - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_exceeded_stops_turn_loop() {
+        struct ExpensiveApi;
+        impl ApiClient for ExpensiveApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    // Report a large usage to push past the budget.
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 500_000,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        // Budget of $1.00 — the above usage at default Sonnet pricing costs ~$52.50.
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ExpensiveApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_budget_usd(1.0);
+
+        let summary = runtime
+            .run_turn("hello", None)
+            .expect("budget exceeded should not be an error");
+
+        assert!(summary.budget_exceeded.is_some());
+        let exceeded = summary.budget_exceeded.unwrap();
+        assert!((exceeded.budget_usd - 1.0).abs() < f64::EPSILON);
+        assert!(exceeded.spent_usd >= 1.0);
+    }
+
+    #[test]
+    fn no_budget_exceeded_when_cost_is_below_limit() {
+        struct CheapApi;
+        impl ApiClient for CheapApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CheapApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_budget_usd(100.0);
+
+        let summary = runtime
+            .run_turn("hello", None)
+            .expect("turn should succeed");
+
+        assert!(summary.budget_exceeded.is_none());
+    }
+
+    #[test]
+    fn budget_exceeded_stops_multi_iteration_tool_loop() {
+        /// An API client that returns a tool_use on the first call (triggering
+        /// another iteration), then a text response with high cost on the
+        /// second call.  A third call would panic — proving the budget check
+        /// prevented it.
+        struct ToolThenExpensiveApi {
+            call_count: usize,
+        }
+        impl ApiClient for ToolThenExpensiveApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.call_count += 1;
+                match self.call_count {
+                    1 => {
+                        // First iteration: tool use + modest cost (stays under budget).
+                        Ok(vec![
+                            AssistantEvent::TextDelta("let me check".to_string()),
+                            AssistantEvent::ToolUse {
+                                id: "tool-1".to_string(),
+                                name: "echo".to_string(),
+                                input: "ping".to_string(),
+                            },
+                            AssistantEvent::Usage(TokenUsage {
+                                input_tokens: 100,
+                                output_tokens: 50,
+                                cache_creation_input_tokens: 0,
+                                cache_read_input_tokens: 0,
+                            }),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    2 => {
+                        // Second iteration: large cost that pushes past the budget.
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::ToolUse {
+                                id: "tool-2".to_string(),
+                                name: "echo".to_string(),
+                                input: "pong".to_string(),
+                            },
+                            AssistantEvent::Usage(TokenUsage {
+                                input_tokens: 1_000_000,
+                                output_tokens: 500_000,
+                                cache_creation_input_tokens: 0,
+                                cache_read_input_tokens: 0,
+                            }),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => panic!("budget check should have stopped the loop after iteration 2"),
+                }
+            }
+        }
+
+        // Budget of $1.00 — iteration 1 costs fractions of a cent, iteration 2
+        // costs ~$4.50 at default pricing, which exceeds the budget.
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolThenExpensiveApi { call_count: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_budget_usd(1.0);
+
+        let summary = runtime
+            .run_turn("run tools", None)
+            .expect("budget exceeded should not be an error");
+
+        assert!(
+            summary.budget_exceeded.is_some(),
+            "budget should have been exceeded after the expensive second iteration"
+        );
+        // The loop ran exactly 2 iterations (not 3 — the budget stopped it).
+        assert_eq!(summary.iterations, 2);
+        let exceeded = summary.budget_exceeded.unwrap();
+        assert!((exceeded.budget_usd - 1.0).abs() < f64::EPSILON);
+        assert!(exceeded.spent_usd >= 1.0);
     }
 }

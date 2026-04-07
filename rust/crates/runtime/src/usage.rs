@@ -164,6 +164,13 @@ pub fn format_usd(amount: f64) -> String {
     format!("${amount:.4}")
 }
 
+/// Indicates that the session's cumulative cost has exceeded the configured budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BudgetExceeded {
+    pub budget_usd: f64,
+    pub spent_usd: f64,
+}
+
 /// Aggregates token usage across a running session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageTracker {
@@ -216,7 +223,7 @@ impl UsageTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
+    use super::{format_usd, pricing_for_model, BudgetExceeded, TokenUsage, UsageTracker};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
     #[test]
@@ -309,5 +316,18 @@ mod tests {
         let tracker = UsageTracker::from_session(&session);
         assert_eq!(tracker.turns(), 1);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 8);
+    }
+
+    #[test]
+    fn test_budget_exceeded_struct() {
+        let exceeded = BudgetExceeded {
+            budget_usd: 5.0,
+            spent_usd: 5.25,
+        };
+        assert!((exceeded.budget_usd - 5.0).abs() < f64::EPSILON);
+        assert!((exceeded.spent_usd - 5.25).abs() < f64::EPSILON);
+
+        let copy = exceeded;
+        assert_eq!(copy, exceeded);
     }
 }

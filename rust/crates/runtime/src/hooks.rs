@@ -172,6 +172,10 @@ impl HookRunner {
 
     #[must_use]
     pub fn run_pre_tool_use(&self, tool_name: &str, tool_input: &str) -> HookRunResult {
+        crate::debug_log(
+            crate::debug::DebugCategory::Hooks,
+            &format!("running pre_tool_use hooks for tool: {tool_name}"),
+        );
         self.run_pre_tool_use_with_context(tool_name, tool_input, None, None)
     }
 

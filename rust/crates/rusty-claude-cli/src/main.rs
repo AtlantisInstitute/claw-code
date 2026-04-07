@@ -25,9 +25,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     detect_provider_kind, oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    AuthSource, ContentBlockDelta, EffortLevel, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, PromptCache, ProviderKind, StreamEvent as ApiStreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ThinkingConfig, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -53,7 +53,8 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput, set_global_question_handler};
+use runtime::{IdeBridge, set_global_ide_bridge};
 
 const DEFAULT_MODEL: &str = "grok-4-1-fast-reasoning";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -85,11 +86,16 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--yes",
     "-y",
     "--max-turns",
+    "--max-budget-usd",
     "--verbose",
+    "--debug",
+    "--debug-file",
     "--allowedTools",
     "--allowed-tools",
     "--resume",
     "--print",
+    "--usage-report",
+    "--ide",
     "-p",
 ];
 
@@ -158,20 +164,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             prompt,
             model,
             output_format,
+            input_format,
             allowed_tools,
             permission_mode,
             max_turns,
-            verbose,
+            max_budget_usd,
+            debug_config,
+            debug_file,
+            effort_level,
         } => {
-            if verbose {
-                eprintln!(
-                    "[verbose] model={model} max_turns={} permission_mode={}",
-                    max_turns.map_or("unlimited".to_string(), |n| n.to_string()),
-                    permission_mode.as_str(),
+            if debug_config.enabled {
+                let logger = runtime::DebugLogger::new(debug_config, debug_file)
+                    .map_err(|e| format!("failed to initialize debug logger: {e}"))?;
+                runtime::set_global_debug_logger(logger);
+                runtime::debug_log(
+                    runtime::DebugCategory::Config,
+                    &format!(
+                        "model={model} max_turns={} permission_mode={} max_budget_usd={}",
+                        max_turns.map_or("unlimited".to_string(), |n| n.to_string()),
+                        permission_mode.as_str(),
+                        max_budget_usd.map_or("unlimited".to_string(), |b| format!("${b:.2}")),
+                    ),
                 );
             }
-            LiveCli::new_with_options(model, true, allowed_tools, permission_mode, max_turns)?
-                .run_turn_with_output(&prompt, output_format)?;
+            // When --input-format json is active, read the prompt from stdin.
+            let effective_prompt = if input_format == InputFormat::Json {
+                read_json_input().map_err(|e| format!("--input-format json: {e}"))?
+            } else {
+                prompt
+            };
+            let mut cli = LiveCli::new_with_options(
+                model,
+                true,
+                allowed_tools,
+                permission_mode,
+                max_turns,
+                effort_level,
+            )?;
+            if let Some(budget) = max_budget_usd {
+                cli.apply_max_budget_usd(budget);
+            }
+            cli.run_turn_with_output(&effective_prompt, output_format)?;
             // Fire Stop hook after the single-prompt session completes.
             if let Some(hook_runner) = tools::try_global_hook_runner() {
                 let _ = hook_runner.run_stop();
@@ -185,14 +218,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            session_name,
+            linked_pr,
+            effort_level,
+            worktree_name,
+            ide,
+        } => {
+            if ide {
+                let bridge = IdeBridge::new();
+                set_global_ide_bridge(bridge);
+                eprintln!("[ide] IDE integration enabled (awaiting connection)");
+            }
+            if let Some(ref wt_name) = worktree_name {
+                match tools::auto_enter_worktree(wt_name) {
+                    Ok(msg) => eprintln!("[worktree] {msg}"),
+                    Err(e) => {
+                        eprintln!("error: failed to enter worktree '{wt_name}': {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            run_repl(
+                model,
+                allowed_tools,
+                permission_mode,
+                session_name,
+                linked_pr,
+                effort_level,
+            )?
+        }
+        CliAction::UsageReport => run_usage_report()?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum CliAction {
     DumpManifests {
         output_format: CliOutputFormat,
@@ -242,10 +304,14 @@ enum CliAction {
         prompt: String,
         model: String,
         output_format: CliOutputFormat,
+        input_format: InputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         max_turns: Option<usize>,
-        verbose: bool,
+        max_budget_usd: Option<f64>,
+        debug_config: runtime::DebugConfig,
+        debug_file: Option<PathBuf>,
+        effort_level: Option<EffortLevel>,
     },
     Login {
         output_format: CliOutputFormat,
@@ -263,7 +329,13 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        session_name: Option<String>,
+        linked_pr: Option<String>,
+        effort_level: Option<EffortLevel>,
+        worktree_name: Option<String>,
+        ide: bool,
     },
+    UsageReport,
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
@@ -282,6 +354,7 @@ enum LocalHelpTopic {
 enum CliOutputFormat {
     Text,
     Json,
+    StreamJson,
 }
 
 impl CliOutputFormat {
@@ -289,23 +362,72 @@ impl CliOutputFormat {
         match value {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
+            "stream-json" => Ok(Self::StreamJson),
             other => Err(format!(
-                "unsupported value for --output-format: {other} (expected text or json)"
+                "unsupported value for --output-format: {other} (expected text, json, or stream-json)"
             )),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFormat {
+    Text,
+    Json,
+}
+
+impl InputFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "unsupported value for --input-format: {other} (expected text or json)"
+            )),
+        }
+    }
+}
+
+/// Emit a single NDJSON line to stdout. Silently drops serialization errors.
+fn emit_ndjson(value: &serde_json::Value) {
+    if let Ok(line) = serde_json::to_string(value) {
+        println!("{}", line);
+    }
+}
+
+/// Read structured JSON input from stdin, extracting the `prompt` field.
+fn read_json_input() -> Result<String, String> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+        .map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&input).map_err(|e| format!("invalid JSON input: {e}"))?;
+    parsed
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| "JSON input must have a 'prompt' field".to_string())
 }
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
     let mut output_format = CliOutputFormat::Text;
+    let mut input_format = InputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
     let mut max_turns: Option<usize> = None;
-    let mut verbose = false;
+    let mut max_budget_usd: Option<f64> = None;
+    let mut debug_config = runtime::DebugConfig::disabled();
+    let mut debug_file: Option<PathBuf> = None;
+    let mut session_name: Option<String> = None;
+    let mut linked_pr: Option<String> = None;
+    let mut effort_level: Option<EffortLevel> = None;
+    let mut worktree_name: Option<String> = None;
+    let mut wants_usage_report = false;
+    let mut wants_ide = false;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -348,6 +470,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format = CliOutputFormat::parse(&flag[16..])?;
                 index += 1;
             }
+            "--input-format" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --input-format".to_string())?;
+                input_format = InputFormat::parse(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--input-format=") => {
+                input_format = InputFormat::parse(&flag[15..])?;
+                index += 1;
+            }
             flag if flag.starts_with("--permission-mode=") => {
                 permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
@@ -372,8 +505,74 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 })?);
                 index += 1;
             }
+            "--max-budget-usd" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --max-budget-usd".to_string())?;
+                let budget = value.parse::<f64>().map_err(|_| {
+                    format!(
+                        "invalid value for --max-budget-usd: {value} (expected a dollar amount)"
+                    )
+                })?;
+                if budget <= 0.0 {
+                    return Err(format!(
+                        "invalid value for --max-budget-usd: {value} (must be a positive dollar amount)"
+                    ));
+                }
+                max_budget_usd = Some(budget);
+                index += 2;
+            }
+            flag if flag.starts_with("--max-budget-usd=") => {
+                let value = &flag[17..];
+                let budget = value.parse::<f64>().map_err(|_| {
+                    format!(
+                        "invalid value for --max-budget-usd: {value} (expected a dollar amount)"
+                    )
+                })?;
+                if budget <= 0.0 {
+                    return Err(format!(
+                        "invalid value for --max-budget-usd: {value} (must be a positive dollar amount)"
+                    ));
+                }
+                max_budget_usd = Some(budget);
+                index += 1;
+            }
+            "--effort" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --effort".to_string())?;
+                effort_level = Some(EffortLevel::parse(value)?);
+                index += 2;
+            }
+            flag if flag.starts_with("--effort=") => {
+                effort_level = Some(EffortLevel::parse(&flag[9..])?);
+                index += 1;
+            }
+            "--debug" | "-d" => {
+                // Optional filter: --debug api,tools
+                let filter = if index + 1 < args.len()
+                    && !args[index + 1].starts_with('-')
+                {
+                    index += 1;
+                    Some(args[index].as_str())
+                } else {
+                    None
+                };
+                debug_config = runtime::DebugConfig::from_filter(filter)
+                    .map_err(|e| format!("invalid --debug filter: {e}"))?;
+                index += 1;
+            }
+            "--debug-file" => {
+                let path = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --debug-file".to_string())?;
+                debug_file = Some(PathBuf::from(path));
+                index += 2;
+            }
             "--verbose" | "-v" => {
-                verbose = true;
+                // Deprecated alias for --debug all.
+                debug_config = runtime::DebugConfig::from_filter(None)
+                    .map_err(|e| format!("--verbose failed: {e}"))?;
                 index += 1;
             }
             "-p" => {
@@ -387,22 +586,39 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     match a {
                         "--model"
                         | "--output-format"
+                        | "--input-format"
                         | "--permission-mode"
                         | "--dangerously-skip-permissions"
                         | "--yes"
                         | "-y"
                         | "--max-turns"
+                        | "--max-budget-usd"
+                        | "--effort"
+                        | "--debug"
+                        | "-d"
+                        | "--debug-file"
                         | "--verbose"
                         | "-v"
                         | "--allowedTools"
                         | "--allowed-tools"
-                        | "--print" => break,
+                        | "--print"
+                        | "--name"
+                        | "--from-pr"
+                        | "--worktree"
+                        | "--usage-report"
+                        | "--ide" => break,
                         _ if a.starts_with("--model=")
                             || a.starts_with("--output-format=")
+                            || a.starts_with("--input-format=")
                             || a.starts_with("--permission-mode=")
                             || a.starts_with("--max-turns=")
+                            || a.starts_with("--max-budget-usd=")
+                            || a.starts_with("--effort=")
                             || a.starts_with("--allowedTools=")
-                            || a.starts_with("--allowed-tools=") =>
+                            || a.starts_with("--allowed-tools=")
+                            || a.starts_with("--name=")
+                            || a.starts_with("--from-pr=")
+                            || a.starts_with("--worktree=") =>
                         {
                             break;
                         }
@@ -424,6 +640,39 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--print" => {
                 // Claude Code compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
+                index += 1;
+            }
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --name".to_string())?;
+                session_name = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--name=") => {
+                session_name = Some(flag[7..].to_string());
+                index += 1;
+            }
+            "--from-pr" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --from-pr".to_string())?;
+                linked_pr = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--from-pr=") => {
+                linked_pr = Some(flag[10..].to_string());
+                index += 1;
+            }
+            "--worktree" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --worktree".to_string())?;
+                worktree_name = Some(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--worktree=") => {
+                worktree_name = Some(flag[11..].to_string());
                 index += 1;
             }
             "--resume" if rest.is_empty() => {
@@ -450,6 +699,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allowed_tool_values.push(flag[16..].to_string());
                 index += 1;
             }
+            "--usage-report" => {
+                wants_usage_report = true;
+                index += 1;
+            }
+            "--ide" => {
+                wants_ide = true;
+                index += 1;
+            }
             other if rest.is_empty() && other.starts_with('-') => {
                 return Err(format_unknown_option(other))
             }
@@ -468,6 +725,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Ok(CliAction::Version { output_format });
     }
 
+    if wants_usage_report {
+        return Ok(CliAction::UsageReport);
+    }
+
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
     if rest.is_empty() {
@@ -476,6 +737,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            session_name,
+            linked_pr,
+            effort_level,
+            worktree_name,
+            ide: wants_ide,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -510,10 +776,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     prompt,
                     model,
                     output_format,
+                    input_format,
                     allowed_tools,
                     permission_mode,
                     max_turns,
-                    verbose,
+                    max_budget_usd,
+                    debug_config: debug_config.clone(),
+                    debug_file: debug_file.clone(),
+                    effort_level,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -534,10 +804,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 prompt,
                 model,
                 output_format,
+                input_format,
                 allowed_tools,
                 permission_mode,
                 max_turns,
-                verbose,
+                max_budget_usd,
+                debug_config: debug_config.clone(),
+                debug_file: debug_file.clone(),
+                effort_level,
             })
         }
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -551,10 +825,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             prompt: rest.join(" "),
             model,
             output_format,
+            input_format,
             allowed_tools,
             permission_mode,
             max_turns,
-            verbose,
+            max_budget_usd,
+            debug_config,
+            debug_file,
+            effort_level,
         }),
     }
 }
@@ -667,10 +945,14 @@ fn parse_direct_slash_cli_action(
                     prompt,
                     model,
                     output_format,
+                    input_format: InputFormat::Text,
                     allowed_tools,
                     permission_mode,
                     max_turns: None,
-                    verbose: false,
+                    max_budget_usd: None,
+                    debug_config: runtime::DebugConfig::disabled(),
+                    debug_file: None,
+                    effort_level: None,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1208,12 +1490,36 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     })
 }
 
+fn run_usage_report() -> Result<(), Box<dyn std::error::Error>> {
+    let sessions_dir = sessions_dir()?;
+    let snapshots = runtime::usage_dashboard::scan_session_files(&sessions_dir);
+    if snapshots.is_empty() {
+        eprintln!("No session data found in {}", sessions_dir.display());
+        return Ok(());
+    }
+    let html = runtime::usage_dashboard::generate_html_report(&snapshots);
+    let config_home = runtime::default_config_home();
+    let path = runtime::usage_dashboard::write_report(&config_home, &html)?;
+    println!("Usage report written to {}", path.display());
+    println!(
+        "  {} sessions, {} total input tokens, {} total output tokens",
+        snapshots.len(),
+        runtime::usage_dashboard::format_tokens(
+            snapshots.iter().map(|s| s.input_tokens).sum()
+        ),
+        runtime::usage_dashboard::format_tokens(
+            snapshots.iter().map(|s| s.output_tokens).sum()
+        ),
+    );
+    Ok(())
+}
+
 fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let report = render_doctor_report()?;
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => {
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => {
             println!("{}", serde_json::to_string_pretty(&report.json_value())?);
         }
     }
@@ -1644,7 +1950,7 @@ fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::err
                     println!("tools: {}", manifest.tools.entries().len());
                     println!("bootstrap phases: {}", manifest.bootstrap.phases().len());
                 }
-                CliOutputFormat::Json => println!(
+                CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "kind": "dump-manifests",
@@ -1672,7 +1978,7 @@ fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn st
                 println!("- {phase}");
             }
         }
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "kind": "bootstrap-plan",
@@ -1760,7 +2066,7 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
     })?;
     match output_format {
         CliOutputFormat::Text => println!("Claw OAuth login complete."),
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "kind": "login",
@@ -1786,7 +2092,9 @@ fn emit_login_browser_open_failure(
     )?;
     match output_format {
         CliOutputFormat::Text => writeln!(stdout, "Open this URL manually:\n{authorize_url}"),
-        CliOutputFormat::Json => writeln!(stderr, "Open this URL manually:\n{authorize_url}"),
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+            writeln!(stderr, "Open this URL manually:\n{authorize_url}")
+        }
     }
 }
 
@@ -1794,7 +2102,7 @@ fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     clear_oauth_credentials()?;
     match output_format {
         CliOutputFormat::Text => println!("Claw OAuth credentials cleared."),
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "kind": "logout",
@@ -1872,7 +2180,7 @@ fn print_system_prompt(
     );
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "kind": "system-prompt",
@@ -1887,7 +2195,7 @@ fn print_system_prompt(
 fn print_version(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     match output_format {
         CliOutputFormat::Text => println!("{}", render_version_report()),
-        CliOutputFormat::Json => {
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => {
             println!("{}", serde_json::to_string_pretty(&version_json_value())?);
         }
     }
@@ -1954,7 +2262,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 json,
             }) => {
                 session = next_session;
-                if output_format == CliOutputFormat::Json {
+                if matches!(output_format, CliOutputFormat::Json | CliOutputFormat::StreamJson) {
                     if let Some(value) = json {
                         println!(
                             "{}",
@@ -2341,6 +2649,7 @@ fn run_resume_command(
                     max_estimated_tokens: 0,
                     ..CompactionConfig::default()
                 },
+                None,
             );
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
@@ -2512,6 +2821,25 @@ fn run_resume_command(
             message: Some(render_doctor_report()?.render()),
             json: None,
         }),
+        SlashCommand::FeatureFlags => {
+            let flags = runtime::global_feature_flags();
+            let gates = flags.all_gates();
+            let msg = if gates.is_empty() {
+                "No feature flags loaded.".to_string()
+            } else {
+                let mut lines = vec![format!("Feature flags ({} gate{}):", gates.len(), if gates.len() == 1 { "" } else { "s" })];
+                for (name, value) in gates {
+                    let icon = if *value { "[ON] " } else { "[OFF]" };
+                    lines.push(format!("  {icon} {name}"));
+                }
+                lines.join("\n")
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(msg),
+                json: None,
+            })
+        }
         SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
@@ -2567,13 +2895,102 @@ fn run_resume_command(
     }
 }
 
+/// CLI question handler for REPL mode — styled prompts with optional timeout.
+struct CliQuestionHandler;
+
+impl tools::UserQuestionHandler for CliQuestionHandler {
+    fn ask(
+        &self,
+        question: &str,
+        options: Option<&[String]>,
+        timeout_ms: Option<u64>,
+    ) -> Result<String, String> {
+        use std::io::{BufRead, Write};
+
+        eprintln!("\n[Question] {}", question);
+
+        if let Some(opts) = options {
+            for (i, opt) in opts.iter().enumerate() {
+                eprintln!("  {}. {}", i + 1, opt);
+            }
+            eprint!("Enter choice (1-{}): ", opts.len());
+        } else {
+            eprint!("Your answer: ");
+        }
+        std::io::stderr().flush().map_err(|e| e.to_string())?;
+
+        // Read with optional timeout
+        let answer = if let Some(ms) = timeout_ms {
+            cli_read_with_timeout(ms)?
+        } else {
+            let mut buf = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut buf)
+                .map_err(|e| e.to_string())?;
+            buf.trim().to_string()
+        };
+
+        // Resolve option number to text
+        if let Some(opts) = options {
+            if let Ok(num) = answer.parse::<usize>() {
+                if num >= 1 && num <= opts.len() {
+                    return Ok(opts[num - 1].clone());
+                }
+            }
+        }
+
+        Ok(answer)
+    }
+}
+
+fn cli_read_with_timeout(timeout_ms: u64) -> Result<String, String> {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut buf);
+        let _ = tx.send(buf.trim().to_string());
+    });
+
+    rx.recv_timeout(Duration::from_millis(timeout_ms))
+        .map_err(|_| format!("Question timed out after {}ms", timeout_ms))
+}
+
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    session_name: Option<String>,
+    linked_pr: Option<String>,
+    effort_level: Option<EffortLevel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Register the CLI question handler so AskUserQuestion uses styled prompts
+    // with timeout support instead of raw stdin.
+    tools::set_global_question_handler(Box::new(CliQuestionHandler));
+
+    // Load feature flags: user-level base, then optional project-level overrides.
+    {
+        let user_flags_path = runtime::default_config_home().join("feature_flags.json");
+        let project_flags_path = PathBuf::from(".claude/feature_flags.local.json");
+        let flags = runtime::FeatureFlags::load_with_overrides(
+            &user_flags_path,
+            if project_flags_path.exists() {
+                Some(&project_flags_path)
+            } else {
+                None
+            },
+        );
+        runtime::set_global_feature_flags(flags);
+    }
+
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let thinking_config = effort_level.map(|e| e.to_thinking_config());
+    let mut cli =
+        LiveCli::new_with_session_meta(resolved_model, true, allowed_tools, permission_mode, session_name, linked_pr, thinking_config)?;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -2637,6 +3054,8 @@ struct ManagedSessionSummary {
     message_count: usize,
     parent_session_id: Option<String>,
     branch_name: Option<String>,
+    name: Option<String>,
+    linked_pr: Option<String>,
 }
 
 struct LiveCli {
@@ -2646,6 +3065,7 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+    thinking_config: Option<ThinkingConfig>,
 }
 
 struct RuntimePluginState {
@@ -2700,6 +3120,14 @@ impl BuiltRuntime {
             .take()
             .expect("runtime should exist when applying max iterations");
         self.runtime = Some(runtime.with_max_iterations(max_iterations));
+    }
+
+    fn apply_max_budget_usd(&mut self, budget: f64) {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist when applying max budget");
+        self.runtime = Some(runtime.with_max_budget_usd(budget));
     }
 
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -3134,7 +3562,50 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_options(model, enable_tools, allowed_tools, permission_mode, None)
+        Self::new_with_options(model, enable_tools, allowed_tools, permission_mode, None, None)
+    }
+
+    fn new_with_session_meta(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        session_name: Option<String>,
+        linked_pr: Option<String>,
+        thinking_config: Option<ThinkingConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let system_prompt = build_system_prompt()?;
+        let mut session_state = Session::new();
+        if let Some(name) = session_name {
+            session_state = session_state.with_name(name);
+        }
+        if let Some(pr) = linked_pr {
+            session_state = session_state.with_linked_pr(pr);
+        }
+        let session = create_managed_session_handle(&session_state.session_id)?;
+        let runtime = build_runtime(
+            session_state.with_persistence_path(session.path.clone()),
+            &session.id,
+            model.clone(),
+            system_prompt.clone(),
+            enable_tools,
+            true,
+            allowed_tools.clone(),
+            permission_mode,
+            None,
+            thinking_config.clone(),
+        )?;
+        let cli = Self {
+            model,
+            allowed_tools,
+            permission_mode,
+            system_prompt,
+            runtime,
+            session,
+            thinking_config,
+        };
+        cli.persist_session()?;
+        Ok(cli)
     }
 
     fn new_with_options(
@@ -3143,10 +3614,12 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         max_turns: Option<usize>,
+        effort_level: Option<EffortLevel>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let thinking_config = effort_level.map(|e| e.to_thinking_config());
         let mut runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
@@ -3157,6 +3630,7 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            thinking_config.clone(),
         )?;
         if let Some(limit) = max_turns {
             runtime.apply_max_iterations(limit);
@@ -3168,9 +3642,14 @@ impl LiveCli {
             system_prompt,
             runtime,
             session,
+            thinking_config,
         };
         cli.persist_session()?;
         Ok(cli)
+    }
+
+    fn apply_max_budget_usd(&mut self, budget: f64) {
+        self.runtime.apply_max_budget_usd(budget);
     }
 
     fn startup_banner(&self) -> String {
@@ -3243,6 +3722,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.thinking_config.clone(),
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -3283,6 +3763,12 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                if let Some(exceeded) = summary.budget_exceeded {
+                    eprintln!(
+                        "Budget limit reached: spent ${:.2} of ${:.2} budget. Stopping.",
+                        exceeded.spent_usd, exceeded.budget_usd
+                    );
+                }
                 self.persist_session()?;
                 Ok(())
             }
@@ -3306,7 +3792,81 @@ impl LiveCli {
         match output_format {
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => self.run_prompt_json(input),
+            CliOutputFormat::StreamJson => self.run_prompt_stream_json(input),
         }
+    }
+
+    /// NDJSON streaming output: emit one JSON object per line for each content
+    /// block and tool interaction, followed by a final `result` event.
+    fn run_prompt_stream_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        hook_abort_monitor.stop();
+        let summary = result?;
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+
+        // Emit text blocks from assistant messages.
+        for message in &summary.assistant_messages {
+            for block in &message.blocks {
+                match block {
+                    ContentBlock::Text { text } => {
+                        emit_ndjson(&json!({"type": "text", "text": text}));
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        emit_ndjson(&json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Emit tool results.
+        for message in &summary.tool_results {
+            for block in &message.blocks {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } = block
+                {
+                    emit_ndjson(&json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "tool_name": tool_name,
+                        "output": output,
+                        "is_error": is_error,
+                    }));
+                }
+            }
+        }
+
+        // Emit final result event.
+        emit_ndjson(&json!({
+            "type": "result",
+            "usage": {
+                "input_tokens": summary.usage.input_tokens,
+                "output_tokens": summary.usage.output_tokens,
+                "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+            },
+            "iterations": summary.iterations,
+            "estimated_cost": format_usd(
+                summary.usage.estimate_cost_usd_with_pricing(
+                    pricing_for_model(&self.model)
+                        .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
+                ).total_cost_usd()
+            ),
+        }));
+
+        Ok(())
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -3341,7 +3901,11 @@ impl LiveCli {
                         pricing_for_model(&self.model)
                             .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
                     ).total_cost_usd()
-                )
+                ),
+                "budget_exceeded": summary.budget_exceeded.map(|exceeded| json!({
+                    "budget_usd": exceeded.budget_usd,
+                    "spent_usd": exceeded.spent_usd,
+                }))
             })
         );
         Ok(())
@@ -3462,6 +4026,36 @@ impl LiveCli {
                 println!("{}", render_doctor_report()?.render());
                 false
             }
+            SlashCommand::FeatureFlags => {
+                let flags = runtime::global_feature_flags();
+                let gates = flags.all_gates();
+                if gates.is_empty() {
+                    println!("No feature flags loaded.");
+                } else {
+                    println!("Feature flags ({} gate{}):", gates.len(), if gates.len() == 1 { "" } else { "s" });
+                    for (name, value) in gates {
+                        let icon = if *value { "\x1b[32m[ON]\x1b[0m " } else { "\x1b[31m[OFF]\x1b[0m" };
+                        println!("  {icon} {name}");
+                    }
+                }
+                false
+            }
+            SlashCommand::Usage { ref scope } => {
+                if scope.as_deref() == Some("report") {
+                    match run_usage_report() {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("Usage report error: {e}"),
+                    }
+                } else {
+                    // Default: show current session usage summary
+                    let cumulative = self.runtime.usage().cumulative_usage();
+                    let lines = cumulative.summary_lines("Session usage");
+                    for line in &lines {
+                        println!("{line}");
+                    }
+                }
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
@@ -3488,7 +4082,6 @@ impl LiveCli {
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
@@ -3588,6 +4181,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.thinking_config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
@@ -3634,6 +4228,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.thinking_config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -3664,6 +4259,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.thinking_config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -3706,6 +4302,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.thinking_config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
@@ -3740,7 +4337,7 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_agents_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
+            CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
                 "{}",
                 serde_json::to_string_pretty(&handle_agents_slash_command_json(args, &cwd)?)?
             ),
@@ -3755,7 +4352,7 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
+            CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
                 "{}",
                 serde_json::to_string_pretty(&handle_mcp_slash_command_json(args, &cwd)?)?
             ),
@@ -3770,7 +4367,7 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
-            CliOutputFormat::Json => println!(
+            CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
                 "{}",
                 serde_json::to_string_pretty(&handle_skills_slash_command_json(args, &cwd)?)?
             ),
@@ -3790,7 +4387,7 @@ impl LiveCli {
         let result = handle_plugins_slash_command(action, target, &mut manager)?;
         match output_format {
             CliOutputFormat::Text => println!("{}", result.message),
-            CliOutputFormat::Json => println!(
+            CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "kind": "plugin",
@@ -3856,6 +4453,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    self.thinking_config.clone(),
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -3891,6 +4489,7 @@ impl LiveCli {
                     self.allowed_tools.clone(),
                     self.permission_mode,
                     None,
+                    self.thinking_config.clone(),
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
@@ -3941,6 +4540,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.thinking_config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()
@@ -3961,6 +4561,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            self.thinking_config.clone(),
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
@@ -3985,6 +4586,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             progress,
+            self.thinking_config.clone(),
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
@@ -4139,7 +4741,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
+        let (id, message_count, parent_session_id, branch_name, name, linked_pr) =
             match Session::load_from_path(&path) {
                 Ok(session) => {
                     let parent_session_id = session
@@ -4155,6 +4757,8 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
                         session.messages.len(),
                         parent_session_id,
                         branch_name,
+                        session.name,
+                        session.linked_pr,
                     )
                 }
                 Err(_) => (
@@ -4163,6 +4767,8 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
                         .unwrap_or("unknown")
                         .to_string(),
                     0,
+                    None,
+                    None,
                     None,
                     None,
                 ),
@@ -4174,6 +4780,8 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             message_count,
             parent_session_id,
             branch_name,
+            name,
+            linked_pr,
         });
     }
     sessions.sort_by(|left, right| {
@@ -4231,8 +4839,18 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
             (Some(branch_name), None) => format!(" branch={branch_name}"),
             (None, None) => String::new(),
         };
+        let name_label = session
+            .name
+            .as_ref()
+            .map(|n| format!(" name={n}"))
+            .unwrap_or_default();
+        let pr_label = session
+            .linked_pr
+            .as_ref()
+            .map(|pr| format!(" pr={pr}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified}{lineage} path={path}",
+            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified}{name_label}{pr_label}{lineage} path={path}",
             id = session.id,
             msgs = session.message_count,
             modified = format_session_modified_age(session.modified_epoch_millis),
@@ -4321,7 +4939,7 @@ fn print_status_snapshot(
             "{}",
             format_status_report(model, usage, permission_mode.as_str(), &context)
         ),
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&status_json_value(
                 model,
@@ -4556,7 +5174,7 @@ fn print_sandbox_status_snapshot(
     let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
     match output_format {
         CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&sandbox_json_value(&status))?
         ),
@@ -4737,7 +5355,7 @@ fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Er
     let message = init_claude_md()?;
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&init_json_value(&message))?
         ),
@@ -5586,6 +6204,7 @@ fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    thinking_config: Option<ThinkingConfig>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let runtime_plugin_state = build_runtime_plugin_state()?;
     build_runtime_with_plugin_state(
@@ -5599,6 +6218,7 @@ fn build_runtime(
         permission_mode,
         progress_reporter,
         runtime_plugin_state,
+        thinking_config,
     )
 }
 
@@ -5615,6 +6235,7 @@ fn build_runtime_with_plugin_state(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
+    thinking_config: Option<ThinkingConfig>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let RuntimePluginState {
         feature_config,
@@ -5635,6 +6256,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            thinking_config,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -5744,6 +6366,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    thinking_config: Option<ThinkingConfig>,
 }
 
 impl AnthropicRuntimeClient {
@@ -5755,6 +6378,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        thinking_config: Option<ThinkingConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let client = api::ProviderClient::from_model_with_anthropic_auth(
             &model,
@@ -5771,6 +6395,7 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            thinking_config,
         })
     }
 }
@@ -5807,9 +6432,17 @@ impl ApiClient for AnthropicRuntimeClient {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let mut max_tokens = max_tokens_for_model(&self.model);
+        if let Some(ref tc) = self.thinking_config {
+            if let ThinkingConfig::Enabled { budget_tokens } = tc {
+                if max_tokens < *budget_tokens {
+                    max_tokens = *budget_tokens;
+                }
+            }
+        }
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens,
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
@@ -5817,6 +6450,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
+            thinking: self.thinking_config.clone(),
         };
 
         self.runtime.block_on(async {
@@ -6912,13 +7546,15 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
+                    } => {
+                        let content_blocks =
+                            convert_tool_result_content_main(output);
+                        InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: content_blocks,
+                            is_error: *is_error,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -6927,6 +7563,36 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             })
         })
         .collect()
+}
+
+/// Inspect a tool result output string. If it wraps a `ReadFileOutput` with
+/// `"kind":"image"`, extract the embedded image source and return an `Image`
+/// content block. Otherwise fall back to a plain `Text` block.
+fn convert_tool_result_content_main(output: &str) -> Vec<ToolResultContentBlock> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output) {
+        if parsed.get("type").and_then(|v| v.as_str()) == Some("image") {
+            if let Some(content_str) = parsed
+                .get("file")
+                .and_then(|f| f.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                if let Ok(image_json) = serde_json::from_str::<serde_json::Value>(content_str) {
+                    if let Some(source) = image_json.get("source") {
+                        if let Ok(image_source) =
+                            serde_json::from_value::<api::ImageSource>(source.clone())
+                        {
+                            return vec![ToolResultContentBlock::Image {
+                                source: image_source,
+                            }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    vec![ToolResultContentBlock::Text {
+        text: output.to_string(),
+    }]
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6941,12 +7607,12 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  claw [--model MODEL] [--output-format text|json|stream-json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  claw [--model MODEL] [--output-format text|json|stream-json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
@@ -6993,7 +7659,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --output-format FORMAT     Non-interactive output format: text or json"
+        "  --output-format FORMAT     Non-interactive output format: text, json, or stream-json"
+    )?;
+    writeln!(
+        out,
+        "  --input-format FORMAT      Input format for prompt mode: text or json"
     )?;
     writeln!(
         out,
@@ -7011,7 +7681,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  --max-turns N              Limit the number of agentic turns (default: unlimited)"
     )?;
-    writeln!(out, "  --verbose, -v              Enable verbose output")?;
+    writeln!(out, "  --debug, -d [FILTER]       Enable debug output (categories: api,hooks,tools,mcp,config,permissions,session,all)")?;
+    writeln!(
+        out,
+        "  --debug-file PATH          Write debug output to a file (in addition to stderr)"
+    )?;
+    writeln!(
+        out,
+        "  --verbose, -v              (deprecated) Alias for --debug all"
+    )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
         out,
@@ -7074,7 +7752,7 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     let message = String::from_utf8(buffer)?;
     match output_format {
         CliOutputFormat::Text => print!("{message}"),
-        CliOutputFormat::Json => println!(
+        CliOutputFormat::Json | CliOutputFormat::StreamJson => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "kind": "help",
@@ -7105,8 +7783,8 @@ mod tests {
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        SlashCommand, StatusUsage, DEFAULT_MODEL,
+        InputFormat, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -7429,6 +8107,11 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                session_name: None,
+                linked_pr: None,
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
             }
         );
     }
@@ -7588,10 +8271,14 @@ mod tests {
                 prompt: "hello world".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
+                input_format: InputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 max_turns: None,
-                verbose: false,
+                max_budget_usd: None,
+                debug_config: runtime::DebugConfig::disabled(),
+                debug_file: None,
+                effort_level: None,
             }
         );
     }
@@ -7613,10 +8300,14 @@ mod tests {
                 prompt: "explain this".to_string(),
                 model: "claude-opus".to_string(),
                 output_format: CliOutputFormat::Json,
+                input_format: InputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 max_turns: None,
-                verbose: false,
+                max_budget_usd: None,
+                debug_config: runtime::DebugConfig::disabled(),
+                debug_file: None,
+                effort_level: None,
             }
         );
     }
@@ -7637,10 +8328,14 @@ mod tests {
                 prompt: "explain this".to_string(),
                 model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Text,
+                input_format: InputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 max_turns: None,
-                verbose: false,
+                max_budget_usd: None,
+                debug_config: runtime::DebugConfig::disabled(),
+                debug_file: None,
+                effort_level: None,
             }
         );
     }
@@ -7678,6 +8373,11 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                session_name: None,
+                linked_pr: None,
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
             }
         );
     }
@@ -7702,6 +8402,11 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
+                session_name: None,
+                linked_pr: None,
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
             }
         );
     }
@@ -7711,6 +8416,114 @@ mod tests {
         let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
+    }
+
+    #[test]
+    fn parses_name_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--name".to_string(), "my-session".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                session_name: Some("my-session".to_string()),
+                linked_pr: None,
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_name_equals_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--name=investigation".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                session_name: Some("investigation".to_string()),
+                linked_pr: None,
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_from_pr_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--from-pr".to_string(),
+            "https://github.com/org/repo/pull/42".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                session_name: None,
+                linked_pr: Some("https://github.com/org/repo/pull/42".to_string()),
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_from_pr_equals_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--from-pr=https://github.com/org/repo/pull/7".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                session_name: None,
+                linked_pr: Some("https://github.com/org/repo/pull/7".to_string()),
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_name_and_from_pr_together() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--name".to_string(),
+            "fix-widget".to_string(),
+            "--from-pr".to_string(),
+            "https://github.com/org/repo/pull/99".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                session_name: Some("fix-widget".to_string()),
+                linked_pr: Some("https://github.com/org/repo/pull/99".to_string()),
+                effort_level: None,
+                worktree_name: None,
+                ide: false,
+            }
+        );
     }
 
     #[test]
@@ -7790,10 +8603,14 @@ mod tests {
                 prompt: "$help overview".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
+                input_format: InputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 max_turns: None,
-                verbose: false,
+                max_budget_usd: None,
+                debug_config: runtime::DebugConfig::disabled(),
+                debug_file: None,
+                effort_level: None,
             }
         );
         assert_eq!(
@@ -7899,10 +8716,14 @@ mod tests {
                 prompt: "help me debug".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
+                input_format: InputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 max_turns: None,
-                verbose: false,
+                max_budget_usd: None,
+                debug_config: runtime::DebugConfig::disabled(),
+                debug_file: None,
+                effort_level: None,
             }
         );
     }
@@ -7965,10 +8786,14 @@ mod tests {
                 prompt: "$help overview".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
+                input_format: InputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 max_turns: None,
-                verbose: false,
+                max_budget_usd: None,
+                debug_config: runtime::DebugConfig::disabled(),
+                debug_file: None,
+                effort_level: None,
             }
         );
         assert_eq!(
@@ -7990,10 +8815,14 @@ mod tests {
                 prompt: "$test".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
+                input_format: InputFormat::Text,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 max_turns: None,
-                verbose: false,
+                max_budget_usd: None,
+                debug_config: runtime::DebugConfig::disabled(),
+                debug_file: None,
+                effort_level: None,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -9560,6 +10389,7 @@ UU conflicted.rs",
             PermissionMode::DangerFullAccess,
             None,
             runtime_plugin_state,
+            None,
         )
         .expect("runtime should build");
 
@@ -9581,6 +10411,436 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn test_parse_max_budget_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--max-budget-usd".to_string(),
+            "5.00".to_string(),
+            "hello".to_string(),
+        ];
+        let action = parse_args(&args).expect("args should parse");
+        match action {
+            CliAction::Prompt {
+                max_budget_usd,
+                prompt,
+                ..
+            } => {
+                assert!(max_budget_usd.is_some());
+                assert!((max_budget_usd.unwrap() - 5.0).abs() < f64::EPSILON);
+                assert_eq!(prompt, "hello");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_max_budget_equals_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--max-budget-usd=5.00".to_string(), "hello".to_string()];
+        let action = parse_args(&args).expect("args should parse");
+        match action {
+            CliAction::Prompt {
+                max_budget_usd,
+                prompt,
+                ..
+            } => {
+                assert!(max_budget_usd.is_some());
+                assert!((max_budget_usd.unwrap() - 5.0).abs() < f64::EPSILON);
+                assert_eq!(prompt, "hello");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_max_budget_invalid_value() {
+        let args = vec![
+            "--max-budget-usd".to_string(),
+            "not-a-number".to_string(),
+            "hello".to_string(),
+        ];
+        let error = parse_args(&args).expect_err("invalid budget should be rejected");
+        assert!(error.contains("invalid value for --max-budget-usd"));
+    }
+
+    #[test]
+    fn test_parse_max_budget_zero_value() {
+        // Space-separated form
+        let args = vec![
+            "--max-budget-usd".to_string(),
+            "0.0".to_string(),
+            "hello".to_string(),
+        ];
+        let error = parse_args(&args).expect_err("zero budget should be rejected");
+        assert!(
+            error.contains("must be a positive dollar amount"),
+            "unexpected error: {error}"
+        );
+
+        // Equals form
+        let args = vec!["--max-budget-usd=0".to_string(), "hello".to_string()];
+        let error = parse_args(&args).expect_err("zero budget (equals form) should be rejected");
+        assert!(
+            error.contains("must be a positive dollar amount"),
+            "unexpected error: {error}"
+        );
+
+        // Negative value
+        let args = vec![
+            "--max-budget-usd".to_string(),
+            "-5.0".to_string(),
+            "hello".to_string(),
+        ];
+        let error = parse_args(&args).expect_err("negative budget should be rejected");
+        assert!(
+            error.contains("must be a positive dollar amount"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_parse_effort_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--effort".to_string(),
+            "high".to_string(),
+            "hello".to_string(),
+        ];
+        let action = parse_args(&args).expect("args should parse");
+        match action {
+            CliAction::Prompt {
+                effort_level,
+                prompt,
+                ..
+            } => {
+                assert_eq!(effort_level, Some(api::EffortLevel::High));
+                assert_eq!(prompt, "hello");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_effort_equals_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--effort=max".to_string(), "hello".to_string()];
+        let action = parse_args(&args).expect("args should parse");
+        match action {
+            CliAction::Prompt {
+                effort_level,
+                prompt,
+                ..
+            } => {
+                assert_eq!(effort_level, Some(api::EffortLevel::Max));
+                assert_eq!(prompt, "hello");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_effort_invalid() {
+        let args = vec![
+            "--effort".to_string(),
+            "turbo".to_string(),
+            "hello".to_string(),
+        ];
+        let error = parse_args(&args).expect_err("invalid effort should be rejected");
+        assert!(error.contains("invalid effort level"));
+        assert!(error.contains("turbo"));
+    }
+
+    #[test]
+    fn test_parse_effort_repl_mode() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--effort".to_string(), "low".to_string()];
+        let action = parse_args(&args).expect("args should parse");
+        match action {
+            CliAction::Repl { effort_level, .. } => {
+                assert_eq!(effort_level, Some(api::EffortLevel::Low));
+            }
+            other => panic!("expected Repl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_debug_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        // -d alone (followed by a flag) = all categories
+        let args = vec!["-d".to_string(), "--max-turns".to_string(), "5".to_string(), "hello".to_string()];
+        let action = parse_args(&args).expect("-d should parse");
+        match action {
+            CliAction::Prompt { debug_config, .. } => {
+                assert!(debug_config.enabled);
+                // Should enable all categories when no filter follows
+                assert!(debug_config.should_log(runtime::DebugCategory::Api));
+                assert!(debug_config.should_log(runtime::DebugCategory::Hooks));
+                assert!(debug_config.should_log(runtime::DebugCategory::Tools));
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+
+        // --debug with a valid category filter
+        let args2 = vec!["--debug".to_string(), "api".to_string(), "hello".to_string(), "world".to_string()];
+        let action2 = parse_args(&args2).expect("--debug api should parse");
+        match action2 {
+            CliAction::Prompt { debug_config, prompt, .. } => {
+                assert!(debug_config.enabled);
+                assert!(debug_config.should_log(runtime::DebugCategory::Api));
+                assert!(!debug_config.should_log(runtime::DebugCategory::Tools));
+                assert_eq!(prompt, "hello world");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_debug_with_filter() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "-d".to_string(),
+            "api,tools".to_string(),
+            "explain".to_string(),
+            "this".to_string(),
+        ];
+        let action = parse_args(&args).expect("-d api,tools should parse");
+        match action {
+            CliAction::Prompt {
+                debug_config,
+                prompt,
+                ..
+            } => {
+                assert!(debug_config.enabled);
+                assert!(debug_config.should_log(runtime::DebugCategory::Api));
+                assert!(debug_config.should_log(runtime::DebugCategory::Tools));
+                assert!(!debug_config.should_log(runtime::DebugCategory::Hooks));
+                assert_eq!(prompt, "explain this");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_verbose_deprecated() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--verbose".to_string(),
+            "explain".to_string(),
+            "this".to_string(),
+        ];
+        let action = parse_args(&args).expect("--verbose should still parse");
+        match action {
+            CliAction::Prompt { debug_config, .. } => {
+                assert!(debug_config.enabled);
+                // --verbose = --debug all
+                assert!(debug_config.should_log(runtime::DebugCategory::Api));
+                assert!(debug_config.should_log(runtime::DebugCategory::Hooks));
+                assert!(debug_config.should_log(runtime::DebugCategory::Tools));
+                assert!(debug_config.should_log(runtime::DebugCategory::Mcp));
+                assert!(debug_config.should_log(runtime::DebugCategory::Config));
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+
+        // -v should also work
+        let args2 = vec!["-v".to_string(), "hello".to_string()];
+        let action2 = parse_args(&args2).expect("-v should still parse");
+        match action2 {
+            CliAction::Prompt { debug_config, .. } => {
+                assert!(debug_config.enabled);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_debug_file_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--debug".to_string(),
+            "--debug-file".to_string(),
+            "/tmp/debug.log".to_string(),
+            "hello".to_string(),
+        ];
+        let action = parse_args(&args).expect("--debug --debug-file should parse");
+        match action {
+            CliAction::Prompt {
+                debug_config,
+                debug_file,
+                ..
+            } => {
+                assert!(debug_config.enabled);
+                assert_eq!(debug_file, Some(PathBuf::from("/tmp/debug.log")));
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_debug_invalid_category() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "-d".to_string(),
+            "bogus".to_string(),
+            "hello".to_string(),
+        ];
+        let result = parse_args(&args);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("unknown debug category"));
+    }
+
+    #[test]
+    fn test_output_format_parse_stream_json() {
+        assert_eq!(
+            CliOutputFormat::parse("stream-json").expect("stream-json should parse"),
+            CliOutputFormat::StreamJson,
+        );
+    }
+
+    #[test]
+    fn test_output_format_parse_known_variants() {
+        assert_eq!(
+            CliOutputFormat::parse("text").expect("text should parse"),
+            CliOutputFormat::Text,
+        );
+        assert_eq!(
+            CliOutputFormat::parse("json").expect("json should parse"),
+            CliOutputFormat::Json,
+        );
+    }
+
+    #[test]
+    fn test_output_format_parse_invalid() {
+        let result = CliOutputFormat::parse("xml");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsupported value for --output-format"),
+            "error should mention --output-format, got: {err}"
+        );
+        assert!(
+            err.contains("stream-json"),
+            "error should list stream-json as a valid option, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_input_format_parse() {
+        assert_eq!(
+            InputFormat::parse("text").expect("text should parse"),
+            InputFormat::Text,
+        );
+        assert_eq!(
+            InputFormat::parse("json").expect("json should parse"),
+            InputFormat::Json,
+        );
+    }
+
+    #[test]
+    fn test_input_format_parse_invalid() {
+        let result = InputFormat::parse("yaml");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsupported value for --input-format"),
+            "error should mention --input-format, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_stream_json_output_format_flag_parses() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--output-format=stream-json".to_string(),
+            "explain".to_string(),
+            "this".to_string(),
+        ];
+        let action = parse_args(&args).expect("stream-json flag should parse");
+        match action {
+            CliAction::Prompt { output_format, .. } => {
+                assert_eq!(output_format, CliOutputFormat::StreamJson);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_input_format_flag_parses() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--input-format".to_string(),
+            "json".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ];
+        let action = parse_args(&args).expect("--input-format json should parse");
+        match action {
+            CliAction::Prompt { input_format, .. } => {
+                assert_eq!(input_format, InputFormat::Json);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_input_format_equals_flag_parses() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--input-format=json".to_string(),
+            "hello".to_string(),
+        ];
+        let action = parse_args(&args).expect("--input-format=json should parse");
+        match action {
+            CliAction::Prompt { input_format, .. } => {
+                assert_eq!(input_format, InputFormat::Json);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_emit_ndjson_produces_valid_json() {
+        // emit_ndjson writes to stdout which we can't easily capture in-process,
+        // but we can verify the serialization logic matches expectations.
+        let value = json!({"type": "text", "text": "hello"});
+        let line = serde_json::to_string(&value).expect("should serialize");
+        // Verify it's a single line (no embedded newlines).
+        assert!(!line.contains('\n'), "NDJSON line must not contain newlines");
+        // Verify it round-trips.
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("should parse back");
+        assert_eq!(parsed["type"], "text");
+        assert_eq!(parsed["text"], "hello");
+    }
+
+    #[test]
+    fn test_default_input_format_is_text() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["hello".to_string()];
+        let action = parse_args(&args).expect("bare prompt should parse");
+        match action {
+            CliAction::Prompt { input_format, .. } => {
+                assert_eq!(input_format, InputFormat::Text);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
     }
 }
 

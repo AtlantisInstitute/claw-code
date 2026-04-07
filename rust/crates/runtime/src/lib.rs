@@ -11,17 +11,23 @@ pub mod branch_lock;
 mod compact;
 mod config;
 mod conversation;
+pub mod debug;
+pub mod feature_flags;
 mod file_ops;
 pub mod green_contract;
 mod hooks;
+pub mod ide_bridge;
 mod json;
 mod lane_events;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
+pub mod mcp_http;
 pub mod mcp_lifecycle_hardened;
+pub mod mcp_sse;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod mcp_transport;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -43,6 +49,7 @@ pub mod team_cron_registry;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
+pub mod usage_dashboard;
 pub mod worker_boot;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
@@ -50,7 +57,8 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    get_compact_continuation_message, llm_summarize_messages, should_compact, CompactionConfig,
+    CompactionResult,
 };
 pub use config::{
     default_config_home, ConfigEntry, ConfigError, ConfigLoader, ConfigSource, HookEntry,
@@ -60,6 +68,10 @@ pub use config::{
     RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
     ScopedMcpServerConfig, CLAUDE_SETTINGS_SCHEMA_NAME,
 };
+pub use debug::{
+    debug_log, is_debug_enabled, set_global_debug_logger, DebugCategory, DebugConfig, DebugLogger,
+};
+pub use feature_flags::{global_feature_flags, set_global_feature_flags, FeatureFlags};
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
@@ -85,6 +97,9 @@ pub use mcp_client::{
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpManagedProxyTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
+pub use mcp_http::McpHttpTransport;
+pub use mcp_sse::McpSseTransport;
+pub use mcp_transport::McpRemoteTransportDriver;
 pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,
@@ -149,12 +164,14 @@ pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, Va
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
-    format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
+    format_usd, pricing_for_model, BudgetExceeded, ModelPricing, TokenUsage, UsageCostEstimate,
+    UsageTracker,
 };
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
     WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
+pub use ide_bridge::{global_ide_bridge, set_global_ide_bridge, IdeBridge};
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

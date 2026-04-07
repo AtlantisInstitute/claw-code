@@ -1,3 +1,4 @@
+use crate::conversation::{ApiClient, ApiRequest, AssistantEvent};
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
@@ -91,9 +92,96 @@ pub fn get_compact_continuation_message(
     base
 }
 
+/// Attempt LLM-powered summarization of messages. Returns `None` on any failure,
+/// so the caller can fall back to the local heuristic [`summarize_messages`].
+pub fn llm_summarize_messages<C: ApiClient>(
+    messages: &[ConversationMessage],
+    api_client: &mut C,
+) -> Option<String> {
+    use std::fmt::Write;
+
+    let mut transcript = String::new();
+    for msg in messages {
+        let role = match msg.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        for block in &msg.blocks {
+            match block {
+                ContentBlock::Text { text } => {
+                    let _ = writeln!(transcript, "[{role}] {text}");
+                }
+                ContentBlock::ToolUse { name, .. } => {
+                    let _ = writeln!(transcript, "[{role}] (used tool: {name})");
+                }
+                ContentBlock::ToolResult {
+                    tool_name, output, ..
+                } => {
+                    let truncated = if output.len() > 200 {
+                        &output[..200]
+                    } else {
+                        output.as_str()
+                    };
+                    let _ = writeln!(transcript, "[tool:{tool_name}] {truncated}");
+                }
+            }
+        }
+    }
+
+    if transcript.is_empty() {
+        return None;
+    }
+
+    // Keep transcript under ~50k chars to fit comfortably in the summarizer's context.
+    let max_transcript = 50_000;
+    if transcript.len() > max_transcript {
+        transcript.truncate(max_transcript);
+        transcript.push_str("\n... (transcript truncated)");
+    }
+
+    let system_prompt = "You are a conversation summarizer. Summarize the following conversation \
+        between a user and an AI assistant. Preserve: 1) Key decisions made, 2) File paths \
+        referenced, 3) Pending work items and next steps, 4) Important context about the project. \
+        Be concise but thorough. Output only the summary, no preamble.";
+
+    let request = ApiRequest {
+        system_prompt: vec![system_prompt.to_string()],
+        messages: vec![ConversationMessage::user_text(transcript)],
+    };
+
+    match api_client.stream(request) {
+        Ok(events) => {
+            let mut summary = String::new();
+            for event in events {
+                if let AssistantEvent::TextDelta(text) = event {
+                    summary.push_str(&text);
+                }
+            }
+            if summary.is_empty() {
+                None
+            } else {
+                // Wrap in <summary> tags for consistency with the heuristic output
+                let trimmed = summary.trim();
+                Some(format!("<summary>\n{trimmed}\n</summary>"))
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// Compacts a session by summarizing older messages and preserving the recent tail.
+///
+/// When `precomputed_summary` is `Some`, it is used directly instead of calling
+/// the local heuristic summarizer, enabling LLM-powered summaries computed by
+/// the caller.
 #[must_use]
-pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
+pub fn compact_session(
+    session: &Session,
+    config: CompactionConfig,
+    precomputed_summary: Option<&str>,
+) -> CompactionResult {
     if !should_compact(session, config) {
         return CompactionResult {
             summary: String::new(),
@@ -114,8 +202,11 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .saturating_sub(config.preserve_recent_messages);
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    let new_section = precomputed_summary.map_or_else(
+        || summarize_messages(removed),
+        String::from,
+    );
+    let summary = merge_compact_summaries(existing_summary.as_deref(), &new_section);
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -526,7 +617,7 @@ mod tests {
         let mut session = Session::new();
         session.messages = vec![ConversationMessage::user_text("hello")];
 
-        let result = compact_session(&session, CompactionConfig::default());
+        let result = compact_session(&session, CompactionConfig::default(), None);
         assert_eq!(result.removed_message_count, 0);
         assert_eq!(result.compacted_session, session);
         assert!(result.summary.is_empty());
@@ -557,6 +648,7 @@ mod tests {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
             },
+            None,
         );
 
         assert_eq!(result.removed_message_count, 2);
@@ -600,7 +692,7 @@ mod tests {
             max_estimated_tokens: 1,
         };
 
-        let first = compact_session(&initial_session, config);
+        let first = compact_session(&initial_session, config, None);
         let mut follow_up_messages = first.compacted_session.messages.clone();
         follow_up_messages.extend([
             ConversationMessage::user_text("Please add regression tests for compaction."),
@@ -611,7 +703,7 @@ mod tests {
 
         let mut second_session = Session::new();
         second_session.messages = follow_up_messages;
-        let second = compact_session(&second_session, config);
+        let second = compact_session(&second_session, config, None);
 
         assert!(second
             .formatted_summary
@@ -692,5 +784,144 @@ mod tests {
         ]);
         assert_eq!(pending.len(), 1);
         assert!(pending[0].contains("Next: update tests"));
+    }
+
+    #[test]
+    fn compact_with_precomputed_summary_uses_it() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("one ".repeat(200)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two ".repeat(200),
+            }]),
+            ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }],
+                usage: None,
+            },
+        ];
+
+        let precomputed = "<summary>\nUser explored file structure. Key file: src/main.rs. Next: add tests.\n</summary>";
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+            Some(precomputed),
+        );
+
+        assert!(result.removed_message_count > 0);
+        assert!(result.summary.contains("add tests"));
+        assert!(result.summary.contains("src/main.rs"));
+        // Verify the heuristic's "Scope:" line is NOT present (LLM summary used instead)
+        assert!(!result.summary.contains("Scope:"));
+    }
+
+    #[test]
+    fn compact_without_precomputed_falls_back_to_heuristic() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("one ".repeat(200)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two ".repeat(200),
+            }]),
+            ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }],
+                usage: None,
+            },
+        ];
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+            None,
+        );
+
+        assert!(result.removed_message_count > 0);
+        // Heuristic summary contains structured data
+        assert!(result.summary.contains("Scope:"));
+        assert!(result.summary.contains("Key timeline:"));
+    }
+
+    #[test]
+    fn llm_summarize_empty_messages_returns_none() {
+        use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
+
+        struct NeverCalledApi;
+        impl ApiClient for NeverCalledApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("should not be called for empty messages");
+            }
+        }
+
+        let mut api = NeverCalledApi;
+        let result = super::llm_summarize_messages(&[], &mut api);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn llm_summarize_returns_none_on_api_error() {
+        use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
+
+        struct FailingApi;
+        impl ApiClient for FailingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::new("network error"))
+            }
+        }
+
+        let messages = vec![ConversationMessage::user_text("hello world")];
+        let mut api = FailingApi;
+        let result = super::llm_summarize_messages(&messages, &mut api);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn llm_summarize_returns_summary_on_success() {
+        use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
+
+        struct SuccessApi;
+        impl ApiClient for SuccessApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("User asked about file X.".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let messages = vec![
+            ConversationMessage::user_text("tell me about file X"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "File X contains module definitions.".to_string(),
+            }]),
+        ];
+        let mut api = SuccessApi;
+        let result = super::llm_summarize_messages(&messages, &mut api);
+        assert!(result.is_some());
+        let summary = result.unwrap();
+        assert!(summary.contains("User asked about file X."));
+        assert!(summary.contains("<summary>"));
+        assert!(summary.contains("</summary>"));
     }
 }

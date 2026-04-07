@@ -14,9 +14,12 @@ use tokio::time::timeout;
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
 use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
+use crate::mcp_http::McpHttpTransport;
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
+use crate::mcp_sse::McpSseTransport;
+use crate::mcp_transport::McpRemoteTransportDriver;
 
 #[cfg(test)]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
@@ -476,9 +479,114 @@ impl ManagedMcpServer {
     }
 }
 
+/// Wrapper enum for non-stdio (remote) MCP transport implementations.
+#[derive(Debug)]
+enum RemoteTransportKind {
+    Http(McpHttpTransport),
+    Sse(McpSseTransport),
+}
+
+/// A managed remote MCP server connection (HTTP or SSE).
+#[derive(Debug)]
+struct ManagedRemoteServer {
+    #[allow(dead_code)] // retained for diagnostics and future signature checks
+    bootstrap: McpClientBootstrap,
+    transport: RemoteTransportKind,
+    initialized: bool,
+}
+
+impl ManagedRemoteServer {
+    fn new(bootstrap: McpClientBootstrap, transport: RemoteTransportKind) -> Self {
+        Self {
+            bootstrap,
+            transport,
+            initialized: false,
+        }
+    }
+
+    #[allow(dead_code)] // used for diagnostics and logging
+    fn transport_type(&self) -> &'static str {
+        match &self.transport {
+            RemoteTransportKind::Http(t) => t.transport_type(),
+            RemoteTransportKind::Sse(t) => t.transport_type(),
+        }
+    }
+
+    #[allow(dead_code)] // used for health-check paths
+    fn is_alive(&self) -> bool {
+        match &self.transport {
+            RemoteTransportKind::Http(t) => t.is_alive(),
+            RemoteTransportKind::Sse(t) => t.is_alive(),
+        }
+    }
+
+    async fn initialize(
+        &mut self,
+        id: JsonRpcId,
+        params: McpInitializeParams,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        match &mut self.transport {
+            RemoteTransportKind::Http(t) => t.initialize(id, params).await,
+            RemoteTransportKind::Sse(t) => t.initialize(id, params).await,
+        }
+    }
+
+    async fn list_tools(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        match &mut self.transport {
+            RemoteTransportKind::Http(t) => t.list_tools(id, params).await,
+            RemoteTransportKind::Sse(t) => t.list_tools(id, params).await,
+        }
+    }
+
+    async fn call_tool(
+        &mut self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        match &mut self.transport {
+            RemoteTransportKind::Http(t) => t.call_tool(id, params).await,
+            RemoteTransportKind::Sse(t) => t.call_tool(id, params).await,
+        }
+    }
+
+    async fn list_resources(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListResourcesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
+        match &mut self.transport {
+            RemoteTransportKind::Http(t) => t.list_resources(id, params).await,
+            RemoteTransportKind::Sse(t) => t.list_resources(id, params).await,
+        }
+    }
+
+    async fn read_resource(
+        &mut self,
+        id: JsonRpcId,
+        params: McpReadResourceParams,
+    ) -> io::Result<JsonRpcResponse<McpReadResourceResult>> {
+        match &mut self.transport {
+            RemoteTransportKind::Http(t) => t.read_resource(id, params).await,
+            RemoteTransportKind::Sse(t) => t.read_resource(id, params).await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match &mut self.transport {
+            RemoteTransportKind::Http(t) => t.shutdown().await,
+            RemoteTransportKind::Sse(t) => t.shutdown().await,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct McpServerManager {
     servers: BTreeMap<String, ManagedMcpServer>,
+    remote_servers: BTreeMap<String, ManagedRemoteServer>,
     unsupported_servers: Vec<UnsupportedMcpServer>,
     tool_index: BTreeMap<String, ToolRoute>,
     next_request_id: u64,
@@ -493,26 +601,96 @@ impl McpServerManager {
     #[must_use]
     pub fn from_servers(servers: &BTreeMap<String, ScopedMcpServerConfig>) -> Self {
         let mut managed_servers = BTreeMap::new();
+        let mut remote_servers = BTreeMap::new();
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
-            if server_config.transport() == McpTransport::Stdio {
-                let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
-                managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
-            } else {
-                unsupported_servers.push(UnsupportedMcpServer {
-                    server_name: server_name.clone(),
-                    transport: server_config.transport(),
-                    reason: format!(
-                        "transport {:?} is not supported by McpServerManager",
-                        server_config.transport()
-                    ),
-                });
+            let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
+            match server_config.transport() {
+                McpTransport::Stdio => {
+                    managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
+                }
+                McpTransport::Http => {
+                    match &bootstrap.transport {
+                        McpClientTransport::Http(remote) => {
+                            match McpHttpTransport::new(&remote.url, remote.headers.clone()) {
+                                Ok(transport) => {
+                                    remote_servers.insert(
+                                        server_name.clone(),
+                                        ManagedRemoteServer::new(
+                                            bootstrap,
+                                            RemoteTransportKind::Http(transport),
+                                        ),
+                                    );
+                                }
+                                Err(error) => {
+                                    unsupported_servers.push(UnsupportedMcpServer {
+                                        server_name: server_name.clone(),
+                                        transport: McpTransport::Http,
+                                        reason: format!(
+                                            "failed to create HTTP transport: {error}"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        _ => {
+                            unsupported_servers.push(UnsupportedMcpServer {
+                                server_name: server_name.clone(),
+                                transport: McpTransport::Http,
+                                reason: "bootstrap transport mismatch".to_string(),
+                            });
+                        }
+                    }
+                }
+                McpTransport::Sse => {
+                    match &bootstrap.transport {
+                        McpClientTransport::Sse(remote) => {
+                            match McpSseTransport::new(&remote.url, remote.headers.clone()) {
+                                Ok(transport) => {
+                                    remote_servers.insert(
+                                        server_name.clone(),
+                                        ManagedRemoteServer::new(
+                                            bootstrap,
+                                            RemoteTransportKind::Sse(transport),
+                                        ),
+                                    );
+                                }
+                                Err(error) => {
+                                    unsupported_servers.push(UnsupportedMcpServer {
+                                        server_name: server_name.clone(),
+                                        transport: McpTransport::Sse,
+                                        reason: format!(
+                                            "failed to create SSE transport: {error}"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        _ => {
+                            unsupported_servers.push(UnsupportedMcpServer {
+                                server_name: server_name.clone(),
+                                transport: McpTransport::Sse,
+                                reason: "bootstrap transport mismatch".to_string(),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    unsupported_servers.push(UnsupportedMcpServer {
+                        server_name: server_name.clone(),
+                        transport: other,
+                        reason: format!(
+                            "transport {other:?} is not yet supported by McpServerManager"
+                        ),
+                    });
+                }
             }
         }
 
         Self {
             servers: managed_servers,
+            remote_servers,
             unsupported_servers,
             tool_index: BTreeMap::new(),
             next_request_id: 1,
@@ -526,7 +704,17 @@ impl McpServerManager {
 
     #[must_use]
     pub fn server_names(&self) -> Vec<String> {
-        self.servers.keys().cloned().collect()
+        self.servers
+            .keys()
+            .chain(self.remote_servers.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the names of remote (HTTP/SSE) servers.
+    #[must_use]
+    pub fn remote_server_names(&self) -> Vec<String> {
+        self.remote_servers.keys().cloned().collect()
     }
 
     pub async fn discover_tools(&mut self) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
@@ -549,17 +737,61 @@ impl McpServerManager {
             }
         }
 
+        // Discover tools from remote (HTTP/SSE) servers
+        let remote_names = self.remote_servers.keys().cloned().collect::<Vec<_>>();
+        for server_name in remote_names {
+            let server_tools = self.discover_tools_for_remote_server(&server_name).await?;
+            self.clear_routes_for_server(&server_name);
+
+            for tool in server_tools {
+                self.tool_index.insert(
+                    tool.qualified_name.clone(),
+                    ToolRoute {
+                        server_name: tool.server_name.clone(),
+                        raw_name: tool.raw_name.clone(),
+                    },
+                );
+                discovered_tools.push(tool);
+            }
+        }
+
         Ok(discovered_tools)
     }
 
     pub async fn discover_tools_best_effort(&mut self) -> McpToolDiscoveryReport {
-        let server_names = self.server_names();
+        let stdio_names = self.servers.keys().cloned().collect::<Vec<_>>();
+        let remote_names = self.remote_servers.keys().cloned().collect::<Vec<_>>();
         let mut discovered_tools = Vec::new();
         let mut working_servers = Vec::new();
         let mut failed_servers = Vec::new();
 
-        for server_name in server_names {
+        // Discover from stdio servers
+        for server_name in stdio_names {
             match self.discover_tools_for_server(&server_name).await {
+                Ok(server_tools) => {
+                    working_servers.push(server_name.clone());
+                    self.clear_routes_for_server(&server_name);
+                    for tool in server_tools {
+                        self.tool_index.insert(
+                            tool.qualified_name.clone(),
+                            ToolRoute {
+                                server_name: tool.server_name.clone(),
+                                raw_name: tool.raw_name.clone(),
+                            },
+                        );
+                        discovered_tools.push(tool);
+                    }
+                }
+                Err(error) => {
+                    self.clear_routes_for_server(&server_name);
+                    failed_servers.push(error.discovery_failure(&server_name));
+                }
+            }
+        }
+
+        // Discover from remote (HTTP/SSE) servers
+        for server_name in remote_names {
+            match self.discover_tools_for_remote_server(&server_name).await {
                 Ok(server_tools) => {
                     working_servers.push(server_name.clone());
                     self.clear_routes_for_server(&server_name);
@@ -634,6 +866,11 @@ impl McpServerManager {
                 qualified_name: qualified_tool_name.to_string(),
             })?;
 
+        // Route to remote server if it exists there
+        if self.remote_servers.contains_key(&route.server_name) {
+            return self.call_remote_tool(&route.server_name, &route.raw_name, arguments).await;
+        }
+
         let timeout_ms = self.tool_call_timeout_ms(&route.server_name)?;
 
         self.ensure_server_ready(&route.server_name).await?;
@@ -677,6 +914,11 @@ impl McpServerManager {
         &mut self,
         server_name: &str,
     ) -> Result<McpListResourcesResult, McpServerManagerError> {
+        // Route to remote server if applicable
+        if self.remote_servers.contains_key(server_name) {
+            return self.list_remote_resources(server_name).await;
+        }
+
         let mut attempts = 0;
 
         loop {
@@ -701,6 +943,11 @@ impl McpServerManager {
         server_name: &str,
         uri: &str,
     ) -> Result<McpReadResourceResult, McpServerManagerError> {
+        // Route to remote server if applicable
+        if self.remote_servers.contains_key(server_name) {
+            return self.read_remote_resource(server_name, uri).await;
+        }
+
         let mut attempts = 0;
 
         loop {
@@ -730,7 +977,284 @@ impl McpServerManager {
             server.process = None;
             server.initialized = false;
         }
+
+        // Shut down remote servers
+        let remote_names = self.remote_servers.keys().cloned().collect::<Vec<_>>();
+        for server_name in remote_names {
+            if let Some(server) = self.remote_servers.get_mut(&server_name) {
+                let _ = server.shutdown().await;
+                server.initialized = false;
+            }
+        }
+
         Ok(())
+    }
+
+    // ---- Remote server (HTTP/SSE) methods ----
+
+    /// Ensure a remote server has been initialized (handshake complete).
+    async fn ensure_remote_server_ready(
+        &mut self,
+        server_name: &str,
+    ) -> Result<(), McpServerManagerError> {
+        let server = self
+            .remote_servers
+            .get(server_name)
+            .ok_or_else(|| McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            })?;
+
+        if server.initialized {
+            return Ok(());
+        }
+
+        let request_id = self.take_request_id();
+        let server = self.remote_servers.get_mut(server_name).ok_or_else(|| {
+            McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            }
+        })?;
+
+        let response = server
+            .initialize(request_id, default_initialize_params())
+            .await
+            .map_err(|source| McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method: "initialize",
+                source,
+            })?;
+
+        if let Some(error) = response.error {
+            return Err(McpServerManagerError::JsonRpc {
+                server_name: server_name.to_string(),
+                method: "initialize",
+                error,
+            });
+        }
+
+        if response.result.is_none() {
+            return Err(McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "initialize",
+                details: "missing result payload".to_string(),
+            });
+        }
+
+        let server = self.remote_servers.get_mut(server_name).ok_or_else(|| {
+            McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            }
+        })?;
+        server.initialized = true;
+        Ok(())
+    }
+
+    /// Discover tools from a remote (HTTP/SSE) server.
+    async fn discover_tools_for_remote_server(
+        &mut self,
+        server_name: &str,
+    ) -> Result<Vec<ManagedMcpTool>, McpServerManagerError> {
+        self.ensure_remote_server_ready(server_name).await?;
+
+        let mut discovered_tools = Vec::new();
+        let mut cursor = None;
+
+        loop {
+            let request_id = self.take_request_id();
+            let server = self.remote_servers.get_mut(server_name).ok_or_else(|| {
+                McpServerManagerError::UnknownServer {
+                    server_name: server_name.to_string(),
+                }
+            })?;
+
+            let response = server
+                .list_tools(
+                    request_id,
+                    Some(McpListToolsParams {
+                        cursor: cursor.clone(),
+                    }),
+                )
+                .await
+                .map_err(|source| McpServerManagerError::Transport {
+                    server_name: server_name.to_string(),
+                    method: "tools/list",
+                    source,
+                })?;
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "tools/list",
+                    error,
+                });
+            }
+
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "tools/list",
+                    details: "missing result payload".to_string(),
+                })?;
+
+            for tool in result.tools {
+                let qualified_name = mcp_tool_name(server_name, &tool.name);
+                discovered_tools.push(ManagedMcpTool {
+                    server_name: server_name.to_string(),
+                    qualified_name,
+                    raw_name: tool.name.clone(),
+                    tool,
+                });
+            }
+
+            match result.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+
+        Ok(discovered_tools)
+    }
+
+    /// List resources from a remote (HTTP/SSE) server.
+    async fn list_remote_resources(
+        &mut self,
+        server_name: &str,
+    ) -> Result<McpListResourcesResult, McpServerManagerError> {
+        self.ensure_remote_server_ready(server_name).await?;
+
+        let mut resources = Vec::new();
+        let mut cursor = None;
+
+        loop {
+            let request_id = self.take_request_id();
+            let server = self.remote_servers.get_mut(server_name).ok_or_else(|| {
+                McpServerManagerError::UnknownServer {
+                    server_name: server_name.to_string(),
+                }
+            })?;
+
+            let response = server
+                .list_resources(
+                    request_id,
+                    Some(McpListResourcesParams {
+                        cursor: cursor.clone(),
+                    }),
+                )
+                .await
+                .map_err(|source| McpServerManagerError::Transport {
+                    server_name: server_name.to_string(),
+                    method: "resources/list",
+                    source,
+                })?;
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "resources/list",
+                    error,
+                });
+            }
+
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "resources/list",
+                    details: "missing result payload".to_string(),
+                })?;
+
+            resources.extend(result.resources);
+
+            match result.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+
+        Ok(McpListResourcesResult {
+            resources,
+            next_cursor: None,
+        })
+    }
+
+    /// Read a resource from a remote (HTTP/SSE) server.
+    async fn read_remote_resource(
+        &mut self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult, McpServerManagerError> {
+        self.ensure_remote_server_ready(server_name).await?;
+
+        let request_id = self.take_request_id();
+        let server = self.remote_servers.get_mut(server_name).ok_or_else(|| {
+            McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            }
+        })?;
+
+        let response = server
+            .read_resource(
+                request_id,
+                McpReadResourceParams {
+                    uri: uri.to_string(),
+                },
+            )
+            .await
+            .map_err(|source| McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method: "resources/read",
+                source,
+            })?;
+
+        if let Some(error) = response.error {
+            return Err(McpServerManagerError::JsonRpc {
+                server_name: server_name.to_string(),
+                method: "resources/read",
+                error,
+            });
+        }
+
+        response
+            .result
+            .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                server_name: server_name.to_string(),
+                method: "resources/read",
+                details: "missing result payload".to_string(),
+            })
+    }
+
+    /// Call a tool on a remote (HTTP/SSE) server.
+    async fn call_remote_tool(
+        &mut self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Option<JsonValue>,
+    ) -> Result<JsonRpcResponse<McpToolCallResult>, McpServerManagerError> {
+        self.ensure_remote_server_ready(server_name).await?;
+
+        let request_id = self.take_request_id();
+        let server = self.remote_servers.get_mut(server_name).ok_or_else(|| {
+            McpServerManagerError::UnknownServer {
+                server_name: server_name.to_string(),
+            }
+        })?;
+
+        server
+            .call_tool(
+                request_id,
+                McpToolCallParams {
+                    name: tool_name.to_string(),
+                    arguments,
+                    meta: None,
+                },
+            )
+            .await
+            .map_err(|source| McpServerManagerError::Transport {
+                server_name: server_name.to_string(),
+                method: "tools/call",
+                source,
+            })
     }
 
     fn clear_routes_for_server(&mut self, server_name: &str) {
@@ -756,20 +1280,26 @@ impl McpServerManager {
     }
 
     fn tool_call_timeout_ms(&self, server_name: &str) -> Result<u64, McpServerManagerError> {
-        let server =
-            self.servers
-                .get(server_name)
-                .ok_or_else(|| McpServerManagerError::UnknownServer {
+        // Check stdio servers first
+        if let Some(server) = self.servers.get(server_name) {
+            return match &server.bootstrap.transport {
+                McpClientTransport::Stdio(transport) => {
+                    Ok(transport.resolved_tool_call_timeout_ms())
+                }
+                other => Err(McpServerManagerError::InvalidResponse {
                     server_name: server_name.to_string(),
-                })?;
-        match &server.bootstrap.transport {
-            McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
-            other => Err(McpServerManagerError::InvalidResponse {
-                server_name: server_name.to_string(),
-                method: "tools/call",
-                details: format!("unsupported MCP transport for stdio manager: {other:?}"),
-            }),
+                    method: "tools/call",
+                    details: format!("unsupported MCP transport for stdio manager: {other:?}"),
+                }),
+            };
         }
+        // Check remote servers — use default timeout for HTTP/SSE
+        if self.remote_servers.contains_key(server_name) {
+            return Ok(crate::mcp_client::DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS);
+        }
+        Err(McpServerManagerError::UnknownServer {
+            server_name: server_name.to_string(),
+        })
     }
 
     fn server_process_exited(&mut self, server_name: &str) -> Result<bool, McpServerManagerError> {
@@ -2811,14 +3341,17 @@ mod tests {
         let manager = McpServerManager::from_servers(&servers);
         let unsupported = manager.unsupported_servers();
 
-        assert_eq!(unsupported.len(), 3);
-        assert_eq!(unsupported[0].server_name, "http");
-        assert_eq!(unsupported[1].server_name, "sdk");
-        assert_eq!(unsupported[2].server_name, "ws");
+        // HTTP is now supported (routed to remote_servers), only SDK and WS remain unsupported
+        assert_eq!(unsupported.len(), 2);
+        assert_eq!(unsupported[0].server_name, "sdk");
+        assert_eq!(unsupported[1].server_name, "ws");
         assert_eq!(
             unsupported_server_failed_server(&unsupported[0]).phase,
             McpLifecyclePhase::ServerRegistration
         );
+
+        // HTTP server should be in remote_servers
+        assert!(manager.remote_server_names().contains(&"http".to_string()));
     }
 
     #[test]
@@ -2924,5 +3457,148 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+
+    #[test]
+    fn from_servers_accepts_http_config_without_crashing() {
+        let servers = BTreeMap::from([(
+            "http-server".to_string(),
+            ScopedMcpServerConfig {
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Http(McpRemoteServerConfig {
+                    url: "https://example.com/mcp".to_string(),
+                    headers: BTreeMap::from([("Authorization".to_string(), "Bearer tok".to_string())]),
+                    headers_helper: None,
+                    oauth: None,
+                }),
+            },
+        )]);
+        let manager = McpServerManager::from_servers(&servers);
+
+        // HTTP server should be in remote_servers, not unsupported
+        assert!(
+            manager.unsupported_servers().is_empty(),
+            "HTTP server should not be unsupported: {:?}",
+            manager.unsupported_servers()
+        );
+        assert!(manager.server_names().contains(&"http-server".to_string()));
+        assert!(manager.remote_server_names().contains(&"http-server".to_string()));
+    }
+
+    #[test]
+    fn from_servers_accepts_sse_config_without_crashing() {
+        let servers = BTreeMap::from([(
+            "sse-server".to_string(),
+            ScopedMcpServerConfig {
+                scope: ConfigSource::Local,
+                config: McpServerConfig::Sse(McpRemoteServerConfig {
+                    url: "https://example.com/events".to_string(),
+                    headers: BTreeMap::new(),
+                    headers_helper: None,
+                    oauth: None,
+                }),
+            },
+        )]);
+        let manager = McpServerManager::from_servers(&servers);
+
+        assert!(
+            manager.unsupported_servers().is_empty(),
+            "SSE server should not be unsupported: {:?}",
+            manager.unsupported_servers()
+        );
+        assert!(manager.server_names().contains(&"sse-server".to_string()));
+        assert!(manager.remote_server_names().contains(&"sse-server".to_string()));
+    }
+
+    #[test]
+    fn from_servers_still_rejects_websocket_and_sdk() {
+        let servers = BTreeMap::from([
+            (
+                "ws-server".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Ws(McpWebSocketServerConfig {
+                        url: "wss://example.com/mcp".to_string(),
+                        headers: BTreeMap::new(),
+                        headers_helper: None,
+                    }),
+                },
+            ),
+            (
+                "sdk-server".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Sdk(McpSdkServerConfig {
+                        name: "sdk-thing".to_string(),
+                    }),
+                },
+            ),
+        ]);
+        let manager = McpServerManager::from_servers(&servers);
+
+        assert_eq!(manager.unsupported_servers().len(), 2);
+        assert!(manager.remote_server_names().is_empty());
+    }
+
+    #[test]
+    fn from_servers_mixes_stdio_http_sse() {
+        let script_path = write_echo_script();
+        let servers = BTreeMap::from([
+            (
+                "stdio-srv".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: script_path.to_string_lossy().into_owned(),
+                        args: vec![],
+                        env: BTreeMap::new(),
+                        tool_call_timeout_ms: None,
+                    }),
+                },
+            ),
+            (
+                "http-srv".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Http(McpRemoteServerConfig {
+                        url: "https://example.com/http".to_string(),
+                        headers: BTreeMap::new(),
+                        headers_helper: None,
+                        oauth: None,
+                    }),
+                },
+            ),
+            (
+                "sse-srv".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Sse(McpRemoteServerConfig {
+                        url: "https://example.com/sse".to_string(),
+                        headers: BTreeMap::new(),
+                        headers_helper: None,
+                        oauth: None,
+                    }),
+                },
+            ),
+        ]);
+        let manager = McpServerManager::from_servers(&servers);
+
+        // All three should be accepted with zero unsupported
+        assert!(
+            manager.unsupported_servers().is_empty(),
+            "all transports should be supported: {:?}",
+            manager.unsupported_servers()
+        );
+        let names = manager.server_names();
+        assert!(names.contains(&"stdio-srv".to_string()));
+        assert!(names.contains(&"http-srv".to_string()));
+        assert!(names.contains(&"sse-srv".to_string()));
+
+        let remote = manager.remote_server_names();
+        assert!(remote.contains(&"http-srv".to_string()));
+        assert!(remote.contains(&"sse-srv".to_string()));
+        assert!(!remote.contains(&"stdio-srv".to_string()));
+
+        cleanup_script(&script_path);
     }
 }

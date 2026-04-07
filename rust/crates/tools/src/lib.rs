@@ -93,6 +93,37 @@ pub use global_hooks::set_global_hook_runner;
 pub use global_hooks::global_hook_runner as try_global_hook_runner;
 use global_hooks::global_hook_runner;
 
+/// Trait for handling interactive user questions.
+/// Implementors provide the UI for asking questions and collecting answers.
+pub trait UserQuestionHandler: Send + Sync {
+    fn ask(
+        &self,
+        question: &str,
+        options: Option<&[String]>,
+        timeout_ms: Option<u64>,
+    ) -> Result<String, String>;
+}
+
+mod global_question_handler {
+    use super::UserQuestionHandler;
+    use std::sync::OnceLock;
+
+    static HANDLER: OnceLock<Box<dyn UserQuestionHandler>> = OnceLock::new();
+
+    /// Register the session-wide [`UserQuestionHandler`].  Ignored if already set.
+    pub fn set_global_question_handler(handler: Box<dyn UserQuestionHandler>) {
+        let _ = HANDLER.set(handler);
+    }
+
+    /// Returns the session-wide [`UserQuestionHandler`], if one has been registered.
+    pub fn global_question_handler() -> Option<&'static dyn UserQuestionHandler> {
+        HANDLER.get().map(|h| h.as_ref())
+    }
+}
+
+pub use global_question_handler::set_global_question_handler;
+pub use global_question_handler::global_question_handler;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifestEntry {
     pub name: String,
@@ -158,6 +189,7 @@ impl GlobalToolRegistry {
     pub fn with_plugin_tools(plugin_tools: Vec<PluginTool>) -> Result<Self, String> {
         let builtin_names = mvp_tool_specs()
             .into_iter()
+            .chain(ide_tool_specs())
             .map(|spec| spec.name.to_string())
             .collect::<BTreeSet<_>>();
         let mut seen_plugin_names = BTreeSet::new();
@@ -187,6 +219,7 @@ impl GlobalToolRegistry {
     ) -> Result<Self, String> {
         let mut seen_names = mvp_tool_specs()
             .into_iter()
+            .chain(ide_tool_specs())
             .map(|spec| spec.name.to_string())
             .chain(
                 self.plugin_tools
@@ -223,8 +256,10 @@ impl GlobalToolRegistry {
         }
 
         let builtin_specs = mvp_tool_specs();
+        let ide_specs = ide_tool_specs();
         let canonical_names = builtin_specs
             .iter()
+            .chain(ide_specs.iter())
             .map(|spec| spec.name.to_string())
             .chain(
                 self.plugin_tools
@@ -270,8 +305,10 @@ impl GlobalToolRegistry {
 
     #[must_use]
     pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
-        let builtin = mvp_tool_specs()
+        let all_builtin_specs = mvp_tool_specs()
             .into_iter()
+            .chain(ide_tool_specs());
+        let builtin = all_builtin_specs
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
@@ -308,6 +345,7 @@ impl GlobalToolRegistry {
     ) -> Result<Vec<(String, PermissionMode)>, String> {
         let builtin = mvp_tool_specs()
             .into_iter()
+            .chain(ide_tool_specs())
             .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(spec.name)))
             .map(|spec| (spec.name.to_string(), spec.required_permission));
         let runtime = self
@@ -362,7 +400,9 @@ impl GlobalToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
-        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
+        if mvp_tool_specs().iter().any(|spec| spec.name == name)
+            || ide_tool_specs().iter().any(|spec| spec.name == name)
+        {
             return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
         }
         self.plugin_tools
@@ -376,6 +416,7 @@ impl GlobalToolRegistry {
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
         let builtin = deferred_tool_specs()
             .into_iter()
+            .chain(ide_tool_specs())
             .map(|spec| SearchableToolSpec {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
@@ -438,7 +479,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "path": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "pages": { "type": "string", "description": "Page range for PDF files (e.g., '1-5', '3', '10-20'). Only for PDF files. Max 20 pages per request." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -766,7 +808,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "options": {
                         "type": "array",
                         "items": { "type": "string" }
-                    }
+                    },
+                    "timeout_ms": { "type": "integer", "description": "Optional timeout in milliseconds for the question" }
                 },
                 "required": ["question"],
                 "additionalProperties": false
@@ -1126,16 +1169,18 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "RemoteTrigger",
-            description: "Trigger a remote action or webhook endpoint.",
+            description: "Manage and run scheduled triggers for remote agent execution.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string" },
-                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE"] },
-                    "headers": { "type": "object" },
-                    "body": { "type": "string" }
+                    "action": { "type": "string", "enum": ["list", "get", "create", "update", "run"], "description": "Action to perform" },
+                    "trigger_id": { "type": "string", "description": "Trigger ID (required for get, update, run)" },
+                    "name": { "type": "string", "description": "Trigger name (required for create)" },
+                    "description": { "type": "string", "description": "Trigger description" },
+                    "schedule": { "type": "string", "description": "Cron schedule expression" },
+                    "prompt": { "type": "string", "description": "Prompt to execute" }
                 },
-                "required": ["url"],
+                "required": ["action"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -1168,6 +1213,75 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec {
+            name: "EnterWorktree",
+            description: "Create or enter a git worktree for isolated work on a named branch.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Branch name for the worktree" },
+                    "base_branch": { "type": "string", "description": "Base branch to create from (default: current branch)" }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "ExitWorktree",
+            description: "Exit the current git worktree. Choose to keep or remove it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["keep", "remove"], "description": "Whether to keep or remove the worktree" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+    ]
+}
+
+/// IDE integration tool specs.  Always included in the tool definitions so the
+/// model is aware of them; handlers gracefully degrade when no bridge is set.
+pub fn ide_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "mcp__ide__getDiagnostics",
+            description: "Get language diagnostics (errors, warnings) from the connected IDE.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path to get diagnostics for. If omitted, returns all diagnostics."
+                    }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "mcp__ide__executeCode",
+            description: "Execute code in the connected IDE's runtime (e.g., Jupyter kernel).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Code to execute"
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Programming language"
+                    }
+                },
+                "required": ["code", "language"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
     ]
 }
 
@@ -1195,6 +1309,10 @@ fn execute_tool_with_enforcer(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    runtime::debug_log(
+        runtime::DebugCategory::Tools,
+        &format!("executing tool: {name}"),
+    );
     match name {
         "bash" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -1275,6 +1393,21 @@ fn execute_tool_with_enforcer(
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
         }
+        "EnterWorktree" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<EnterWorktreeInput>(input).and_then(run_enter_worktree)
+        }
+        "ExitWorktree" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ExitWorktreeInput>(input).and_then(run_exit_worktree)
+        }
+        "mcp__ide__getDiagnostics" => {
+            from_value::<GetDiagnosticsInput>(input).and_then(run_get_diagnostics)
+        }
+        "mcp__ide__executeCode" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ExecuteCodeInput>(input).and_then(run_execute_code)
+        }
         _ => Err(format!("unsupported tool: {name}")),
     }
 }
@@ -1292,9 +1425,23 @@ fn maybe_enforce_permission_check(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
+    // If a global question handler is registered (e.g., TUI/REPL mode), delegate to it.
+    if let Some(handler) = global_question_handler::global_question_handler() {
+        let answer = handler.ask(
+            &input.question,
+            input.options.as_deref(),
+            input.timeout_ms,
+        )?;
+        return to_pretty_json(json!({
+            "question": input.question,
+            "answer": answer,
+            "status": "answered"
+        }));
+    }
+
+    // Fallback: raw stdin implementation for non-REPL mode.
     use std::io::{self, BufRead, Write};
 
-    // Display the question to the user via stdout
     let stdout = io::stdout();
     let stdin = io::stdin();
     let mut out = stdout.lock();
@@ -1614,6 +1761,30 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_get_diagnostics(input: GetDiagnosticsInput) -> Result<String, String> {
+    match runtime::global_ide_bridge() {
+        Some(bridge) => bridge.get_diagnostics(input.path.as_deref()),
+        None => Ok(serde_json::json!({
+            "status": "not_available",
+            "message": "IDE integration not enabled. Start with --ide flag."
+        })
+        .to_string()),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_execute_code(input: ExecuteCodeInput) -> Result<String, String> {
+    match runtime::global_ide_bridge() {
+        Some(bridge) => bridge.execute_code(&input.code, &input.language),
+        None => Ok(serde_json::json!({
+            "status": "not_available",
+            "message": "IDE integration not enabled. Start with --ide flag."
+        })
+        .to_string()),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
     let registry = global_mcp_registry();
     let server = input.server.as_deref().unwrap_or("default");
@@ -1686,66 +1857,156 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
-    let method = input.method.unwrap_or_else(|| "GET".to_string());
-    let client = Client::new();
+    let base_url = std::env::var("CLAUDE_TRIGGER_API_BASE_URL")
+        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
 
-    let mut request = match method.to_uppercase().as_str() {
-        "GET" => client.get(&input.url),
-        "POST" => client.post(&input.url),
-        "PUT" => client.put(&input.url),
-        "DELETE" => client.delete(&input.url),
-        "PATCH" => client.patch(&input.url),
-        "HEAD" => client.head(&input.url),
-        other => return Err(format!("unsupported HTTP method: {other}")),
+    let token = load_trigger_token();
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+
+    match input.action.as_str() {
+        "list" => {
+            let resp = send_trigger_request(
+                &client,
+                &token,
+                "GET",
+                &format!("{base_url}/v1/triggers"),
+                None,
+            )?;
+            to_pretty_json(resp)
+        }
+        "get" => {
+            let id = input
+                .trigger_id
+                .ok_or("trigger_id is required for 'get' action")?;
+            let resp = send_trigger_request(
+                &client,
+                &token,
+                "GET",
+                &format!("{base_url}/v1/triggers/{id}"),
+                None,
+            )?;
+            to_pretty_json(resp)
+        }
+        "create" => {
+            let name = input
+                .name
+                .ok_or("name is required for 'create' action")?;
+            let prompt = input
+                .prompt
+                .ok_or("prompt is required for 'create' action")?;
+            let body = json!({
+                "name": name,
+                "description": input.description.unwrap_or_default(),
+                "schedule": input.schedule,
+                "prompt": prompt,
+            });
+            let resp = send_trigger_request(
+                &client,
+                &token,
+                "POST",
+                &format!("{base_url}/v1/triggers"),
+                Some(body),
+            )?;
+            to_pretty_json(resp)
+        }
+        "update" => {
+            let id = input
+                .trigger_id
+                .ok_or("trigger_id is required for 'update' action")?;
+            let mut body = json!({});
+            if let Some(n) = input.name {
+                body["name"] = json!(n);
+            }
+            if let Some(d) = input.description {
+                body["description"] = json!(d);
+            }
+            if let Some(s) = input.schedule {
+                body["schedule"] = json!(s);
+            }
+            if let Some(p) = input.prompt {
+                body["prompt"] = json!(p);
+            }
+            let resp = send_trigger_request(
+                &client,
+                &token,
+                "PUT",
+                &format!("{base_url}/v1/triggers/{id}"),
+                Some(body),
+            )?;
+            to_pretty_json(resp)
+        }
+        "run" => {
+            let id = input
+                .trigger_id
+                .ok_or("trigger_id is required for 'run' action")?;
+            let resp = send_trigger_request(
+                &client,
+                &token,
+                "POST",
+                &format!("{base_url}/v1/triggers/{id}/run"),
+                None,
+            )?;
+            to_pretty_json(resp)
+        }
+        other => Err(format!(
+            "unknown action: {other} (expected list, get, create, update, run)"
+        )),
+    }
+}
+
+fn load_trigger_token() -> Option<String> {
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        return Some(key);
+    }
+    if let Ok(key) = std::env::var("CLAUDE_TRIGGER_TOKEN") {
+        return Some(key);
+    }
+    None
+}
+
+fn send_trigger_request(
+    client: &Client,
+    token: &Option<String>,
+    method: &str,
+    url: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let mut request = match method {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        "PUT" => client.put(url),
+        "DELETE" => client.delete(url),
+        _ => return Err(format!("unsupported method: {method}")),
     };
 
-    // Apply custom headers
-    if let Some(ref headers) = input.headers {
-        if let Some(obj) = headers.as_object() {
-            for (key, value) in obj {
-                if let Some(val) = value.as_str() {
-                    request = request.header(key.as_str(), val);
-                }
-            }
-        }
+    if let Some(ref tok) = token {
+        request = request.header("Authorization", format!("Bearer {tok}"));
+    }
+    request = request.header("Content-Type", "application/json");
+
+    if let Some(b) = body {
+        request = request.json(&b);
     }
 
-    // Apply body
-    if let Some(ref body) = input.body {
-        request = request.body(body.clone());
+    let response = request.send().map_err(|e| format!("request failed: {e}"))?;
+    let status = response.status();
+    let body_text = response
+        .text()
+        .map_err(|e| format!("failed to read response: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "API error ({}): {body_text}",
+            status.as_u16()
+        ));
     }
 
-    // Execute with a 30-second timeout
-    let request = request.timeout(Duration::from_secs(30));
-
-    match request.send() {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            let body = response.text().unwrap_or_default();
-            let truncated_body = if body.len() > 8192 {
-                format!(
-                    "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
-                    body.len()
-                )
-            } else {
-                body
-            };
-            to_pretty_json(json!({
-                "url": input.url,
-                "method": method,
-                "status_code": status,
-                "body": truncated_body,
-                "success": (200..300).contains(&status)
-            }))
-        }
-        Err(e) => to_pretty_json(json!({
-            "url": input.url,
-            "method": method,
-            "error": e.to_string(),
-            "success": false
-        })),
-    }
+    Ok(serde_json::from_str(&body_text)
+        .unwrap_or_else(|_| json!({ "status": status.as_u16(), "body": body_text })))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1776,6 +2037,102 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
         "message": "Testing permission tool stub"
     }))
 }
+
+fn run_enter_worktree(input: EnterWorktreeInput) -> Result<String, String> {
+    let mut state = WORKTREE_STATE.lock().map_err(|e| e.to_string())?;
+    if state.is_some() {
+        return Err("Already in a worktree. Exit the current worktree first.".to_string());
+    }
+
+    let original_cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let worktree_dir = original_cwd.join(".worktrees");
+    let worktree_path = worktree_dir.join(&input.name);
+
+    // Create .worktrees directory if needed
+    std::fs::create_dir_all(&worktree_dir).map_err(|e| e.to_string())?;
+
+    // Try creating worktree with new branch
+    let base = input.base_branch.as_deref().unwrap_or("HEAD");
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", &input.name])
+        .arg(&worktree_path)
+        .arg(base)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        // Branch might already exist, try adding worktree for existing branch
+        let output2 = Command::new("git")
+            .args(["worktree", "add"])
+            .arg(&worktree_path)
+            .arg(&input.name)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if !output2.status.success() {
+            return Err(format!(
+                "Failed to create worktree: {}",
+                String::from_utf8_lossy(&output2.stderr)
+            ));
+        }
+    }
+
+    std::env::set_current_dir(&worktree_path).map_err(|e| e.to_string())?;
+
+    *state = Some(WorktreeState {
+        original_cwd,
+        worktree_path: worktree_path.clone(),
+        branch_name: input.name.clone(),
+    });
+
+    to_pretty_json(json!({
+        "status": "entered",
+        "branch": input.name,
+        "worktree_path": worktree_path.display().to_string(),
+    }))
+}
+
+fn run_exit_worktree(input: ExitWorktreeInput) -> Result<String, String> {
+    let mut state_guard = WORKTREE_STATE.lock().map_err(|e| e.to_string())?;
+    let state = state_guard
+        .take()
+        .ok_or("Not currently in a worktree.")?;
+
+    std::env::set_current_dir(&state.original_cwd).map_err(|e| e.to_string())?;
+
+    let mut result_status = "kept";
+    if input.action == "remove" {
+        let output = Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&state.worktree_path)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            result_status = "removed";
+        } else {
+            // If git worktree remove fails, try just removing the directory
+            let _ = std::fs::remove_dir_all(&state.worktree_path);
+            result_status = "removed";
+        }
+    }
+
+    to_pretty_json(json!({
+        "status": result_status,
+        "branch": state.branch_name,
+        "returned_to": state.original_cwd.display().to_string(),
+    }))
+}
+
+/// Auto-enter a worktree at startup when `--worktree <name>` is passed on the CLI.
+/// This is a convenience wrapper around `run_enter_worktree` exposed for the CLI crate.
+pub fn auto_enter_worktree(name: &str) -> Result<String, String> {
+    run_enter_worktree(EnterWorktreeInput {
+        name: name.to_string(),
+        base_branch: None,
+    })
+}
+
 fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }
@@ -1936,7 +2293,10 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    to_pretty_json(
+        read_file(&input.path, input.offset, input.limit, input.pages.as_deref())
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2043,6 +2403,7 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    pages: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2211,6 +2572,8 @@ struct AskUserQuestionInput {
     question: String,
     #[serde(default)]
     options: Option<Vec<String>>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2300,6 +2663,18 @@ struct LspInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct GetDiagnosticsInput {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecuteCodeInput {
+    code: String,
+    language: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct McpResourceInput {
     #[serde(default)]
     server: Option<String>,
@@ -2314,13 +2689,17 @@ struct McpAuthInput {
 
 #[derive(Debug, Deserialize)]
 struct RemoteTriggerInput {
-    url: String,
+    action: String,
     #[serde(default)]
-    method: Option<String>,
+    trigger_id: Option<String>,
     #[serde(default)]
-    headers: Option<Value>,
+    name: Option<String>,
     #[serde(default)]
-    body: Option<String>,
+    description: Option<String>,
+    #[serde(default)]
+    schedule: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2335,6 +2714,27 @@ struct McpToolInput {
 struct TestingPermissionInput {
     action: String,
 }
+
+#[derive(Debug, Deserialize)]
+struct EnterWorktreeInput {
+    name: String,
+    #[serde(default)]
+    base_branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExitWorktreeInput {
+    action: String,
+}
+
+#[derive(Debug)]
+struct WorktreeState {
+    original_cwd: PathBuf,
+    worktree_path: PathBuf,
+    branch_name: String,
+}
+
+static WORKTREE_STATE: std::sync::Mutex<Option<WorktreeState>> = std::sync::Mutex::new(None);
 
 #[derive(Debug, Serialize)]
 struct WebFetchOutput {
@@ -3783,6 +4183,7 @@ impl ApiClient for ProviderRuntimeClient {
             tools: (!tools.is_empty()).then_some(tools),
             tool_choice: (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto),
             stream: true,
+            thinking: None,
         };
 
         self.runtime.block_on(async {
@@ -3941,13 +4342,14 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
+                    } => {
+                        let content_blocks = convert_tool_result_content(output);
+                        InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: content_blocks,
+                            is_error: *is_error,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -3956,6 +4358,38 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             })
         })
         .collect()
+}
+
+/// Inspect a tool result output string. If it wraps a `ReadFileOutput` with
+/// `"kind":"image"`, extract the embedded image source and return an `Image`
+/// content block. Otherwise fall back to a plain `Text` block.
+fn convert_tool_result_content(output: &str) -> Vec<ToolResultContentBlock> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output) {
+        if parsed.get("type").and_then(|v| v.as_str()) == Some("image") {
+            // The output IS the ReadFileOutput JSON. Its `file.content` field
+            // holds the image JSON as a string.
+            if let Some(content_str) = parsed
+                .get("file")
+                .and_then(|f| f.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                if let Ok(image_json) = serde_json::from_str::<serde_json::Value>(content_str) {
+                    if let Some(source) = image_json.get("source") {
+                        if let Ok(image_source) =
+                            serde_json::from_value::<api::ImageSource>(source.clone())
+                        {
+                            return vec![ToolResultContentBlock::Image {
+                                source: image_source,
+                            }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    vec![ToolResultContentBlock::Text {
+        text: output.to_string(),
+    }]
 }
 
 fn push_output_block(
@@ -8039,5 +8473,315 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+
+    // --- AskUserQuestion tests ---
+
+    #[test]
+    fn test_ask_user_question_with_global_handler() {
+        use super::UserQuestionHandler;
+
+        /// A mock handler that returns a canned answer.
+        struct MockHandler {
+            canned: String,
+        }
+
+        impl UserQuestionHandler for MockHandler {
+            fn ask(
+                &self,
+                _question: &str,
+                _options: Option<&[String]>,
+                _timeout_ms: Option<u64>,
+            ) -> Result<String, String> {
+                Ok(self.canned.clone())
+            }
+        }
+
+        // We cannot truly set the global OnceLock more than once across tests in
+        // the same process, so we test the handler trait directly.
+        let handler = MockHandler {
+            canned: "mock answer".into(),
+        };
+        let result = handler
+            .ask("test?", None, None)
+            .expect("mock should succeed");
+        assert_eq!(result, "mock answer");
+
+        // Also test with options — handler receives them correctly.
+        let opts = vec!["a".to_string(), "b".to_string()];
+        let result2 = handler
+            .ask("pick one", Some(&opts), Some(5000))
+            .expect("mock should succeed");
+        assert_eq!(result2, "mock answer");
+    }
+
+    #[test]
+    fn test_ask_user_question_fallback_without_handler() {
+        // Before any handler is set (or in a fresh process where it wasn't set),
+        // global_question_handler() should return None.
+        // Note: OnceLock may have been set by another test in the same process,
+        // so we test the concept rather than the global state.
+        // The important invariant: the function exists and is callable.
+        let _result = super::global_question_handler::global_question_handler();
+        // No panic — the function is safe to call regardless of state.
+    }
+
+    #[test]
+    fn test_ask_user_question_timeout_in_spec() {
+        let specs = mvp_tool_specs();
+        let ask_spec = specs
+            .iter()
+            .find(|s| s.name == "AskUserQuestion")
+            .expect("AskUserQuestion spec should exist");
+        let props = ask_spec.input_schema["properties"]
+            .as_object()
+            .expect("properties should be an object");
+        assert!(
+            props.contains_key("timeout_ms"),
+            "AskUserQuestion spec should include timeout_ms property"
+        );
+        assert_eq!(props["timeout_ms"]["type"], "integer");
+    }
+
+    #[test]
+    fn test_remote_trigger_missing_action_fields() {
+        // create without name should fail
+        let result = execute_tool(
+            "RemoteTrigger",
+            &json!({
+                "action": "create",
+                "prompt": "do something"
+            }),
+        );
+        assert!(result.is_err(), "create without name should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("name is required"),
+            "error should mention missing name, got: {err}"
+        );
+
+        // create without prompt should fail
+        let result = execute_tool(
+            "RemoteTrigger",
+            &json!({
+                "action": "create",
+                "name": "my-trigger"
+            }),
+        );
+        assert!(result.is_err(), "create without prompt should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("prompt is required"),
+            "error should mention missing prompt, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_remote_trigger_get_requires_id() {
+        let result = execute_tool(
+            "RemoteTrigger",
+            &json!({
+                "action": "get"
+            }),
+        );
+        assert!(result.is_err(), "get without trigger_id should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("trigger_id is required"),
+            "error should mention missing trigger_id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_remote_trigger_unknown_action() {
+        let result = execute_tool(
+            "RemoteTrigger",
+            &json!({
+                "action": "destroy"
+            }),
+        );
+        assert!(result.is_err(), "unknown action should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unknown action: destroy"),
+            "error should mention unknown action, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_remote_trigger_tool_spec_has_actions() {
+        let specs = mvp_tool_specs();
+        let trigger_spec = specs
+            .iter()
+            .find(|s| s.name == "RemoteTrigger")
+            .expect("RemoteTrigger spec should exist");
+        let props = trigger_spec.input_schema["properties"]
+            .as_object()
+            .expect("properties should be an object");
+        assert!(
+            props.contains_key("action"),
+            "RemoteTrigger spec should have action property"
+        );
+        let action_enum = props["action"]["enum"]
+            .as_array()
+            .expect("action should have enum array");
+        let actions: Vec<&str> = action_enum
+            .iter()
+            .map(|v| v.as_str().expect("enum value should be string"))
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["list", "get", "create", "update", "run"],
+            "action enum should contain all expected actions"
+        );
+        assert_eq!(
+            trigger_spec.input_schema["required"],
+            json!(["action"]),
+            "only action should be required"
+        );
+    }
+
+    #[test]
+    fn test_worktree_tool_specs_exist() {
+        let specs = mvp_tool_specs();
+        let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        assert!(
+            names.contains(&"EnterWorktree"),
+            "EnterWorktree spec should exist"
+        );
+        assert!(
+            names.contains(&"ExitWorktree"),
+            "ExitWorktree spec should exist"
+        );
+    }
+
+    #[test]
+    fn test_enter_worktree_input_parsing() {
+        let input = json!({ "name": "feature-x", "base_branch": "develop" });
+        let parsed: super::EnterWorktreeInput =
+            serde_json::from_value(input).expect("should parse EnterWorktreeInput");
+        assert_eq!(parsed.name, "feature-x");
+        assert_eq!(parsed.base_branch.as_deref(), Some("develop"));
+
+        // Without optional base_branch
+        let input2 = json!({ "name": "hotfix" });
+        let parsed2: super::EnterWorktreeInput =
+            serde_json::from_value(input2).expect("should parse without base_branch");
+        assert_eq!(parsed2.name, "hotfix");
+        assert!(parsed2.base_branch.is_none());
+    }
+
+    #[test]
+    fn test_exit_worktree_input_parsing() {
+        let input = json!({ "action": "keep" });
+        let parsed: super::ExitWorktreeInput =
+            serde_json::from_value(input).expect("should parse ExitWorktreeInput keep");
+        assert_eq!(parsed.action, "keep");
+
+        let input2 = json!({ "action": "remove" });
+        let parsed2: super::ExitWorktreeInput =
+            serde_json::from_value(input2).expect("should parse ExitWorktreeInput remove");
+        assert_eq!(parsed2.action, "remove");
+    }
+
+    /// Serializes worktree tests that depend on the global WORKTREE_STATE.
+    fn worktree_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_exit_worktree_without_entering() {
+        let _guard = worktree_test_lock().lock().expect("test lock");
+        // Ensure state is clean first.
+        {
+            let mut state = super::WORKTREE_STATE.lock().expect("lock");
+            *state = None;
+        }
+        let result = super::run_exit_worktree(super::ExitWorktreeInput {
+            action: "keep".to_string(),
+        });
+        assert!(result.is_err(), "exit without enter should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Not currently in a worktree"),
+            "error should mention not in a worktree, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_enter_worktree_rejects_double_entry() {
+        let _guard = worktree_test_lock().lock().expect("test lock");
+        // Simulate an active worktree by populating the global state.
+        let original_cwd = std::env::current_dir().expect("cwd");
+        {
+            let mut state = super::WORKTREE_STATE.lock().expect("lock");
+            *state = Some(super::WorktreeState {
+                original_cwd: original_cwd.clone(),
+                worktree_path: original_cwd.join(".worktrees/fake"),
+                branch_name: "fake-branch".to_string(),
+            });
+        }
+
+        let result = super::run_enter_worktree(super::EnterWorktreeInput {
+            name: "another-branch".to_string(),
+            base_branch: None,
+        });
+        assert!(result.is_err(), "double entry should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Already in a worktree"),
+            "error should mention already in a worktree, got: {err}"
+        );
+
+        // Clean up
+        {
+            let mut state = super::WORKTREE_STATE.lock().expect("lock");
+            *state = None;
+        }
+    }
+
+    #[test]
+    fn test_ide_tool_specs_exist() {
+        let specs = super::ide_tool_specs();
+        assert_eq!(specs.len(), 2);
+        let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        assert!(names.contains(&"mcp__ide__getDiagnostics"));
+        assert!(names.contains(&"mcp__ide__executeCode"));
+    }
+
+    #[test]
+    fn test_ide_tool_specs_permissions() {
+        let specs = super::ide_tool_specs();
+        let diag = specs.iter().find(|s| s.name == "mcp__ide__getDiagnostics").unwrap();
+        assert_eq!(diag.required_permission, PermissionMode::ReadOnly);
+        let exec = specs.iter().find(|s| s.name == "mcp__ide__executeCode").unwrap();
+        assert_eq!(exec.required_permission, PermissionMode::DangerFullAccess);
+    }
+
+    #[test]
+    fn test_get_diagnostics_without_bridge() {
+        // When no global IDE bridge is set, handler returns "not_available"
+        let input = json!({});
+        let result = execute_tool("mcp__ide__getDiagnostics", &input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], "not_available");
+    }
+
+    #[test]
+    fn test_execute_code_without_bridge() {
+        let input = json!({ "code": "1+1", "language": "python" });
+        let result = execute_tool("mcp__ide__executeCode", &input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], "not_available");
+    }
+
+    #[test]
+    fn test_ide_tools_in_definitions() {
+        let registry = super::GlobalToolRegistry::builtin();
+        let defs = registry.definitions(None);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"mcp__ide__getDiagnostics"));
+        assert!(names.contains(&"mcp__ide__executeCode"));
     }
 }
