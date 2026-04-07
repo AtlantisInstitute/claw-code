@@ -556,33 +556,8 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
-            return None;
-        }
-
-        let _ = self.hook_runner.run_pre_compact();
-
-        // Auto-compaction uses the fast heuristic summarizer (not LLM) to avoid
-        // adding an extra API round-trip mid-turn in the tool loop.
-        let result = compact_session(
-            &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
-            None,
-        );
-
-        if result.removed_message_count == 0 {
-            return None;
-        }
-
-        self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
-            removed_message_count: result.removed_message_count,
-        })
+        // Auto-compaction disabled.
+        None
     }
 
     /// Attempt LLM summarization of the messages that would be compacted.
@@ -1604,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compaction_disabled_even_when_threshold_is_crossed() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -1649,13 +1624,8 @@ mod tests {
             .run_turn("trigger", None)
             .expect("turn should succeed");
 
-        assert_eq!(
-            summary.auto_compaction,
-            Some(AutoCompactionEvent {
-                removed_message_count: 2,
-            })
-        );
-        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+        // Auto-compaction is disabled — always returns None regardless of threshold.
+        assert_eq!(summary.auto_compaction, None);
     }
 
     #[test]
