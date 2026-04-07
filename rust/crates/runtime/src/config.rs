@@ -64,15 +64,50 @@ pub struct RuntimeFeatureConfig {
     enable_all_project_mcp_servers: bool,
 }
 
+/// A single hook entry: a shell command with an optional tool-name matcher.
+///
+/// When `matcher` is empty, the hook fires for every tool invocation.
+/// When `matcher` is non-empty, it only fires when the tool name matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookEntry {
+    pub matcher: String,
+    pub command: String,
+}
+
+impl HookEntry {
+    /// Create a hook entry that matches all tools (empty matcher).
+    #[must_use]
+    pub fn unmatched(command: String) -> Self {
+        Self {
+            matcher: String::new(),
+            command,
+        }
+    }
+
+    /// Create a hook entry that only fires for the given tool name.
+    #[must_use]
+    pub fn matched(matcher: String, command: String) -> Self {
+        Self { matcher, command }
+    }
+
+    /// Returns `true` when this entry should run for the given `tool_name`.
+    ///
+    /// An empty matcher matches everything.
+    #[must_use]
+    pub fn matches_tool(&self, tool_name: &str) -> bool {
+        self.matcher.is_empty() || self.matcher == tool_name
+    }
+}
+
 /// Hook command lists grouped by lifecycle stage.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeHookConfig {
-    pre_tool_use: Vec<String>,
-    post_tool_use: Vec<String>,
-    post_tool_use_failure: Vec<String>,
-    subagent_start: Vec<String>,
-    pre_compact: Vec<String>,
-    stop: Vec<String>,
+    pre_tool_use: Vec<HookEntry>,
+    post_tool_use: Vec<HookEntry>,
+    post_tool_use_failure: Vec<HookEntry>,
+    subagent_start: Vec<HookEntry>,
+    pre_compact: Vec<HookEntry>,
+    stop: Vec<HookEntry>,
 }
 
 /// Raw permission rule lists grouped by allow, deny, and ask behavior.
@@ -503,12 +538,12 @@ pub fn default_config_home() -> PathBuf {
 impl RuntimeHookConfig {
     #[must_use]
     pub fn new(
-        pre_tool_use: Vec<String>,
-        post_tool_use: Vec<String>,
-        post_tool_use_failure: Vec<String>,
-        subagent_start: Vec<String>,
-        pre_compact: Vec<String>,
-        stop: Vec<String>,
+        pre_tool_use: Vec<HookEntry>,
+        post_tool_use: Vec<HookEntry>,
+        post_tool_use_failure: Vec<HookEntry>,
+        subagent_start: Vec<HookEntry>,
+        pre_compact: Vec<HookEntry>,
+        stop: Vec<HookEntry>,
     ) -> Self {
         Self {
             pre_tool_use,
@@ -520,13 +555,35 @@ impl RuntimeHookConfig {
         }
     }
 
+    /// Convenience constructor that wraps plain command strings as unmatched
+    /// hook entries (empty matcher — matches all tools).  Useful for tests and
+    /// backwards-compatible config paths.
     #[must_use]
-    pub fn pre_tool_use(&self) -> &[String] {
+    pub fn from_plain_commands(
+        pre_tool_use: Vec<String>,
+        post_tool_use: Vec<String>,
+        post_tool_use_failure: Vec<String>,
+        subagent_start: Vec<String>,
+        pre_compact: Vec<String>,
+        stop: Vec<String>,
+    ) -> Self {
+        Self {
+            pre_tool_use: pre_tool_use.into_iter().map(HookEntry::unmatched).collect(),
+            post_tool_use: post_tool_use.into_iter().map(HookEntry::unmatched).collect(),
+            post_tool_use_failure: post_tool_use_failure.into_iter().map(HookEntry::unmatched).collect(),
+            subagent_start: subagent_start.into_iter().map(HookEntry::unmatched).collect(),
+            pre_compact: pre_compact.into_iter().map(HookEntry::unmatched).collect(),
+            stop: stop.into_iter().map(HookEntry::unmatched).collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn pre_tool_use(&self) -> &[HookEntry] {
         &self.pre_tool_use
     }
 
     #[must_use]
-    pub fn post_tool_use(&self) -> &[String] {
+    pub fn post_tool_use(&self) -> &[HookEntry] {
         &self.post_tool_use
     }
 
@@ -538,34 +595,34 @@ impl RuntimeHookConfig {
     }
 
     pub fn extend(&mut self, other: &Self) {
-        extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
-        extend_unique(&mut self.post_tool_use, other.post_tool_use());
-        extend_unique(
+        extend_unique_entries(&mut self.pre_tool_use, other.pre_tool_use());
+        extend_unique_entries(&mut self.post_tool_use, other.post_tool_use());
+        extend_unique_entries(
             &mut self.post_tool_use_failure,
             other.post_tool_use_failure(),
         );
-        extend_unique(&mut self.subagent_start, other.subagent_start());
-        extend_unique(&mut self.pre_compact, other.pre_compact());
-        extend_unique(&mut self.stop, other.stop());
+        extend_unique_entries(&mut self.subagent_start, other.subagent_start());
+        extend_unique_entries(&mut self.pre_compact, other.pre_compact());
+        extend_unique_entries(&mut self.stop, other.stop());
     }
 
     #[must_use]
-    pub fn post_tool_use_failure(&self) -> &[String] {
+    pub fn post_tool_use_failure(&self) -> &[HookEntry] {
         &self.post_tool_use_failure
     }
 
     #[must_use]
-    pub fn subagent_start(&self) -> &[String] {
+    pub fn subagent_start(&self) -> &[HookEntry] {
         &self.subagent_start
     }
 
     #[must_use]
-    pub fn pre_compact(&self) -> &[String] {
+    pub fn pre_compact(&self) -> &[HookEntry] {
         &self.pre_compact
     }
 
     #[must_use]
-    pub fn stop(&self) -> &[String] {
+    pub fn stop(&self) -> &[HookEntry] {
         &self.stop
     }
 }
@@ -706,15 +763,86 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
-        post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
-            .unwrap_or_default(),
-        subagent_start: optional_string_array(hooks, "SubagentStart", context)?
-            .unwrap_or_default(),
-        pre_compact: optional_string_array(hooks, "PreCompact", context)?.unwrap_or_default(),
-        stop: optional_string_array(hooks, "Stop", context)?.unwrap_or_default(),
+        pre_tool_use: parse_hook_entries(hooks, "PreToolUse", context)?,
+        post_tool_use: parse_hook_entries(hooks, "PostToolUse", context)?,
+        post_tool_use_failure: parse_hook_entries(hooks, "PostToolUseFailure", context)?,
+        subagent_start: parse_hook_entries(hooks, "SubagentStart", context)?,
+        pre_compact: parse_hook_entries(hooks, "PreCompact", context)?,
+        stop: parse_hook_entries(hooks, "Stop", context)?,
     })
+}
+
+/// Parse a hook array that may contain either plain strings (Claw Code format)
+/// or matcher objects (Claude Code format).
+///
+/// Plain string format:   `["cmd1", "cmd2"]`
+/// Matcher object format: `[{"matcher": "Bash", "hooks": [{"type": "command", "command": "cmd"}]}]`
+///
+/// The two formats can even be mixed in a single array.
+fn parse_hook_entries(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<HookEntry>, ConfigError> {
+    let Some(value) = object.get(key) else {
+        return Ok(Vec::new());
+    };
+    let array = value.as_array().ok_or_else(|| {
+        ConfigError::Parse(format!("{context}: field {key} must be an array"))
+    })?;
+
+    let mut entries = Vec::new();
+    for item in array {
+        if let Some(s) = item.as_str() {
+            // Simple string format — command with empty matcher
+            entries.push(HookEntry::unmatched(s.to_owned()));
+        } else if let Some(obj) = item.as_object() {
+            // Claude Code complex format: {"matcher": "...", "hooks": [...]}
+            let matcher = obj
+                .get("matcher")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let inner_hooks = obj
+                .get("hooks")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    ConfigError::Parse(format!(
+                        "{context}: field {key} matcher object must have a \"hooks\" array"
+                    ))
+                })?;
+            for hook_obj in inner_hooks {
+                let hook_map = hook_obj.as_object().ok_or_else(|| {
+                    ConfigError::Parse(format!(
+                        "{context}: field {key} hooks array must contain objects"
+                    ))
+                })?;
+                // Validate type field if present (should be "command")
+                if let Some(type_val) = hook_map.get("type").and_then(JsonValue::as_str) {
+                    if type_val != "command" {
+                        return Err(ConfigError::Parse(format!(
+                            "{context}: field {key} hook type must be \"command\", got \"{type_val}\""
+                        )));
+                    }
+                }
+                let command = hook_map
+                    .get("command")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        ConfigError::Parse(format!(
+                            "{context}: field {key} hook object must have a \"command\" string"
+                        ))
+                    })?
+                    .to_owned();
+                entries.push(HookEntry::matched(matcher.clone(), command));
+            }
+        } else {
+            return Err(ConfigError::Parse(format!(
+                "{context}: field {key} items must be strings or matcher objects"
+            )));
+        }
+    }
+    Ok(entries)
 }
 
 fn validate_optional_hooks_config(
@@ -1134,22 +1262,18 @@ fn deep_merge_objects(
     }
 }
 
-fn extend_unique(target: &mut Vec<String>, values: &[String]) {
+fn extend_unique_entries(target: &mut Vec<HookEntry>, values: &[HookEntry]) {
     for value in values {
-        push_unique(target, value.clone());
-    }
-}
-
-fn push_unique(target: &mut Vec<String>, value: String) {
-    if !target.iter().any(|existing| existing == &value) {
-        target.push(value);
+        if !target.iter().any(|existing| existing == value) {
+            target.push(value.clone());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
+        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource, HookEntry,
         McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
         RuntimePluginConfig, CLAUDE_SETTINGS_SCHEMA_NAME,
     };
@@ -1255,12 +1379,12 @@ mod tests {
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PostToolUse"));
-        assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
-        assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
-        assert_eq!(
-            loaded.hooks().post_tool_use_failure(),
-            &["project-failure".to_string()]
-        );
+        assert_eq!(loaded.hooks().pre_tool_use().len(), 1);
+        assert_eq!(loaded.hooks().pre_tool_use()[0].command, "base");
+        assert_eq!(loaded.hooks().post_tool_use().len(), 1);
+        assert_eq!(loaded.hooks().post_tool_use()[0].command, "project");
+        assert_eq!(loaded.hooks().post_tool_use_failure().len(), 1);
+        assert_eq!(loaded.hooks().post_tool_use_failure()[0].command, "project-failure");
         assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
         assert_eq!(
             loaded.permission_rules().deny(),
@@ -1641,10 +1765,154 @@ mod tests {
         // then
         let rendered = error.to_string();
         assert!(rendered.contains(&format!(
-            "{}: hooks: field PreToolUse must contain only strings",
+            "{}: hooks: field PreToolUse items must be strings or matcher objects",
             project_settings.display()
         )));
         assert!(!rendered.contains("merged settings.hooks"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_claude_code_complex_hook_format() {
+        // given — Claude Code's complex format with matcher objects
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {"type": "command", "command": "echo bash-hook-1"},
+                                {"type": "command", "command": "echo bash-hook-2"}
+                            ]
+                        },
+                        {
+                            "matcher": "Edit",
+                            "hooks": [
+                                {"type": "command", "command": "echo edit-hook"}
+                            ]
+                        }
+                    ],
+                    "PostToolUse": [
+                        {
+                            "matcher": "Write",
+                            "hooks": [
+                                {"type": "command", "command": "echo write-post"}
+                            ]
+                        }
+                    ],
+                    "PreCompact": [
+                        {
+                            "matcher": "",
+                            "hooks": [
+                                {"type": "command", "command": "echo compact"}
+                            ]
+                        }
+                    ],
+                    "SubagentStart": [
+                        {
+                            "matcher": "",
+                            "hooks": [
+                                {"type": "command", "command": "echo subagent"}
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("write complex hooks settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load complex hooks");
+
+        // then — verify PreToolUse entries
+        let pre = loaded.hooks().pre_tool_use();
+        assert_eq!(pre.len(), 3, "expected 3 PreToolUse entries (2 Bash + 1 Edit)");
+        assert_eq!(pre[0].matcher, "Bash");
+        assert_eq!(pre[0].command, "echo bash-hook-1");
+        assert_eq!(pre[1].matcher, "Bash");
+        assert_eq!(pre[1].command, "echo bash-hook-2");
+        assert_eq!(pre[2].matcher, "Edit");
+        assert_eq!(pre[2].command, "echo edit-hook");
+
+        // verify matcher filtering
+        assert!(pre[0].matches_tool("Bash"));
+        assert!(!pre[0].matches_tool("Edit"));
+        assert!(pre[2].matches_tool("Edit"));
+        assert!(!pre[2].matches_tool("Bash"));
+
+        // verify PostToolUse
+        let post = loaded.hooks().post_tool_use();
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0].matcher, "Write");
+        assert_eq!(post[0].command, "echo write-post");
+
+        // verify PreCompact (empty matcher = match all)
+        let compact = loaded.hooks().pre_compact();
+        assert_eq!(compact.len(), 1);
+        assert_eq!(compact[0].matcher, "");
+        assert!(compact[0].matches_tool("anything"));
+
+        // verify SubagentStart
+        let subagent = loaded.hooks().subagent_start();
+        assert_eq!(subagent.len(), 1);
+        assert_eq!(subagent[0].command, "echo subagent");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_mixed_hook_format() {
+        // given — mix of simple strings and matcher objects in one array
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".claude").join("settings.json"),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [
+                        "echo simple-hook",
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {"type": "command", "command": "echo bash-only"}
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("write mixed hooks settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load mixed hooks");
+
+        // then
+        let pre = loaded.hooks().pre_tool_use();
+        assert_eq!(pre.len(), 2);
+        // Simple string becomes unmatched (empty matcher)
+        assert_eq!(pre[0].matcher, "");
+        assert_eq!(pre[0].command, "echo simple-hook");
+        assert!(pre[0].matches_tool("anything"));
+        // Object format preserves matcher
+        assert_eq!(pre[1].matcher, "Bash");
+        assert_eq!(pre[1].command, "echo bash-only");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -1669,7 +1937,7 @@ mod tests {
     #[test]
     fn hook_config_merge_preserves_uniques() {
         // given
-        let base = RuntimeHookConfig::new(
+        let base = RuntimeHookConfig::from_plain_commands(
             vec!["pre-a".to_string()],
             vec!["post-a".to_string()],
             vec!["failure-a".to_string()],
@@ -1677,7 +1945,7 @@ mod tests {
             vec!["compact-a".to_string()],
             vec!["stop-a".to_string()],
         );
-        let overlay = RuntimeHookConfig::new(
+        let overlay = RuntimeHookConfig::from_plain_commands(
             vec!["pre-a".to_string(), "pre-b".to_string()],
             vec!["post-a".to_string(), "post-b".to_string()],
             vec!["failure-b".to_string()],
@@ -1690,30 +1958,24 @@ mod tests {
         let merged = base.merged(&overlay);
 
         // then
+        let cmds = |entries: &[HookEntry]| -> Vec<String> {
+            entries.iter().map(|e| e.command.clone()).collect()
+        };
+        assert_eq!(cmds(merged.pre_tool_use()), vec!["pre-a", "pre-b"]);
+        assert_eq!(cmds(merged.post_tool_use()), vec!["post-a", "post-b"]);
         assert_eq!(
-            merged.pre_tool_use(),
-            &["pre-a".to_string(), "pre-b".to_string()]
+            cmds(merged.post_tool_use_failure()),
+            vec!["failure-a", "failure-b"]
         );
         assert_eq!(
-            merged.post_tool_use(),
-            &["post-a".to_string(), "post-b".to_string()]
+            cmds(merged.subagent_start()),
+            vec!["subagent-a", "subagent-b"]
         );
         assert_eq!(
-            merged.post_tool_use_failure(),
-            &["failure-a".to_string(), "failure-b".to_string()]
+            cmds(merged.pre_compact()),
+            vec!["compact-a", "compact-b"]
         );
-        assert_eq!(
-            merged.subagent_start(),
-            &["subagent-a".to_string(), "subagent-b".to_string()]
-        );
-        assert_eq!(
-            merged.pre_compact(),
-            &["compact-a".to_string(), "compact-b".to_string()]
-        );
-        assert_eq!(
-            merged.stop(),
-            &["stop-a".to_string(), "stop-b".to_string()]
-        );
+        assert_eq!(cmds(merged.stop()), vec!["stop-a", "stop-b"]);
     }
 
     #[test]

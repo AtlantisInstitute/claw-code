@@ -5236,7 +5236,7 @@ fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
 }
 
 fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::RuntimeHookConfig {
-    runtime::RuntimeHookConfig::new(
+    runtime::RuntimeHookConfig::from_plain_commands(
         hooks.pre_tool_use,
         hooks.post_tool_use,
         hooks.post_tool_use_failure,
@@ -9344,7 +9344,7 @@ UU conflicted.rs",
         let pre_hooks = state.feature_config.hooks().pre_tool_use();
         assert_eq!(pre_hooks.len(), 1);
         assert!(
-            pre_hooks[0].ends_with("hooks/pre.sh"),
+            pre_hooks[0].command.ends_with("hooks/pre.sh"),
             "expected installed plugin hook path, got {pre_hooks:?}"
         );
 

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::config::{HookEntry, RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
 pub type HookPermissionDecision = PermissionOverride;
@@ -323,8 +323,8 @@ impl HookRunner {
         agent_type: &str,
         task_description: &str,
     ) -> HookRunResult {
-        let commands = self.config.subagent_start();
-        if commands.is_empty() {
+        let entries = self.config.subagent_start();
+        if entries.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
 
@@ -338,7 +338,12 @@ impl HookRunner {
 
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for entry in entries {
+            // SubagentStart has no tool_name, so only run entries with empty matcher
+            if !entry.matcher.is_empty() {
+                continue;
+            }
+            let command = &entry.command;
             let mut child = shell_command(command);
             child.stdin(Stdio::piped());
             child.stdout(Stdio::piped());
@@ -415,8 +420,8 @@ impl HookRunner {
     /// proceeds regardless of the hook outcome.
     #[must_use]
     pub fn run_pre_compact(&self) -> HookRunResult {
-        let commands = self.config.pre_compact();
-        if commands.is_empty() {
+        let entries = self.config.pre_compact();
+        if entries.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
 
@@ -428,7 +433,12 @@ impl HookRunner {
 
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for entry in entries {
+            // PreCompact has no tool_name, so only run entries with empty matcher
+            if !entry.matcher.is_empty() {
+                continue;
+            }
+            let command = &entry.command;
             let mut child = shell_command(command);
             child.stdin(Stdio::piped());
             child.stdout(Stdio::piped());
@@ -502,8 +512,8 @@ impl HookRunner {
     /// — the process exits regardless of hook outcome.
     #[must_use]
     pub fn run_stop(&self) -> HookRunResult {
-        let commands = self.config.stop();
-        if commands.is_empty() {
+        let entries = self.config.stop();
+        if entries.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
 
@@ -515,7 +525,12 @@ impl HookRunner {
 
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for entry in entries {
+            // Stop has no tool_name, so only run entries with empty matcher
+            if !entry.matcher.is_empty() {
+                continue;
+            }
+            let command = &entry.command;
             let mut child = shell_command(command);
             child.stdin(Stdio::piped());
             child.stdout(Stdio::piped());
@@ -584,7 +599,7 @@ impl HookRunner {
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,
-        commands: &[String],
+        entries: &[HookEntry],
         tool_name: &str,
         tool_input: &str,
         tool_output: Option<&str>,
@@ -592,7 +607,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         mut reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        if commands.is_empty() {
+        if entries.is_empty() {
             return HookRunResult::allow(Vec::new());
         }
 
@@ -614,7 +629,13 @@ impl HookRunner {
         let payload = hook_payload(event, tool_name, tool_input, tool_output, is_error).to_string();
         let mut result = HookRunResult::allow(Vec::new());
 
-        for command in commands {
+        for entry in entries {
+            // Skip entries whose matcher doesn't match the current tool
+            if !entry.matches_tool(tool_name) {
+                continue;
+            }
+
+            let command = &entry.command;
             if let Some(reporter) = reporter.as_deref_mut() {
                 reporter.on_event(&HookProgressEvent::Started {
                     event,
@@ -1021,7 +1042,7 @@ mod tests {
 
     #[test]
     fn allows_exit_code_zero_and_captures_stdout() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             vec![shell_snippet("printf 'pre ok'")],
             Vec::new(),
             Vec::new(),
@@ -1037,7 +1058,7 @@ mod tests {
 
     #[test]
     fn denies_exit_code_two() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             vec![shell_snippet("printf 'blocked by hook'; exit 2")],
             Vec::new(),
             Vec::new(),
@@ -1055,7 +1076,7 @@ mod tests {
     #[test]
     fn propagates_other_non_zero_statuses_as_failures() {
         let runner = HookRunner::from_feature_config(&RuntimeFeatureConfig::default().with_hooks(
-            RuntimeHookConfig::new(
+            RuntimeHookConfig::from_plain_commands(
                 vec![shell_snippet("printf 'warning hook'; exit 1")],
                 Vec::new(),
                 Vec::new(),
@@ -1079,7 +1100,7 @@ mod tests {
 
     #[test]
     fn parses_pre_hook_permission_override_and_updated_input() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             vec![shell_snippet(
                 r#"printf '%s' '{"systemMessage":"updated","hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"hook ok","updatedInput":{"command":"git status"}}}'"#,
             )],
@@ -1104,7 +1125,7 @@ mod tests {
     #[test]
     fn runs_post_tool_use_failure_hooks() {
         // given
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             vec![shell_snippet("printf 'failure hook ran'")],
@@ -1125,7 +1146,7 @@ mod tests {
     #[test]
     fn stops_running_failure_hooks_after_failure() {
         // given
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             vec![
@@ -1156,7 +1177,7 @@ mod tests {
     #[test]
     fn executes_hooks_in_configured_order() {
         // given
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             vec![
                 shell_snippet("printf 'first'"),
                 shell_snippet("printf 'second'"),
@@ -1220,7 +1241,7 @@ mod tests {
     #[test]
     fn stops_running_hooks_after_failure() {
         // given
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             vec![
                 shell_snippet("printf 'broken'; exit 1"),
                 shell_snippet("printf 'later'"),
@@ -1246,7 +1267,7 @@ mod tests {
 
     #[test]
     fn abort_signal_cancels_long_running_hook_and_reports_progress() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             vec![shell_snippet("sleep 5")],
             Vec::new(),
             Vec::new(),
@@ -1290,7 +1311,7 @@ mod tests {
     #[test]
     fn subagent_start_hook_runs_and_captures_output() {
         // given
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1311,7 +1332,7 @@ mod tests {
     #[test]
     fn subagent_start_hook_sets_env_vars() {
         // given — a hook that echoes back the env vars it receives
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1335,7 +1356,7 @@ mod tests {
 
     #[test]
     fn subagent_start_noop_when_no_hooks_configured() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1354,7 +1375,7 @@ mod tests {
     #[test]
     fn pre_compact_hook_runs_and_captures_output() {
         // given
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1375,7 +1396,7 @@ mod tests {
     #[test]
     fn pre_compact_hook_sets_env_var() {
         // given — a hook that echoes back the CLAUDE_HOOK_EVENT env var
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1399,7 +1420,7 @@ mod tests {
 
     #[test]
     fn pre_compact_noop_when_no_hooks_configured() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1418,7 +1439,7 @@ mod tests {
     #[test]
     fn stop_hook_runs_and_captures_output() {
         // given
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1439,7 +1460,7 @@ mod tests {
     #[test]
     fn stop_hook_sets_env_var() {
         // given — a hook that echoes back the CLAUDE_HOOK_EVENT env var
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1463,7 +1484,7 @@ mod tests {
 
     #[test]
     fn stop_noop_when_no_hooks_configured() {
-        let runner = HookRunner::new(RuntimeHookConfig::new(
+        let runner = HookRunner::new(RuntimeHookConfig::from_plain_commands(
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1477,6 +1498,60 @@ mod tests {
         assert!(!result.is_denied());
         assert!(!result.is_failed());
         assert!(result.messages().is_empty());
+    }
+
+    #[test]
+    fn matcher_filters_hooks_by_tool_name() {
+        // given — two hooks: one for "Bash" only, one for all tools
+        use crate::config::HookEntry;
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![
+                HookEntry::matched("Bash".to_string(), shell_snippet("printf 'bash-only'")),
+                HookEntry::unmatched(shell_snippet("printf 'all-tools'")),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        // when invoked with tool_name="Read", the Bash matcher should be skipped
+        let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
+        assert_eq!(result.messages(), &["all-tools".to_string()]);
+
+        // when invoked with tool_name="Bash", both should run
+        let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);
+        assert_eq!(
+            result.messages(),
+            &["bash-only".to_string(), "all-tools".to_string()]
+        );
+    }
+
+    #[test]
+    fn matcher_filters_post_tool_use_by_tool_name() {
+        // given — a post hook only for "Edit"
+        use crate::config::HookEntry;
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            Vec::new(),
+            vec![HookEntry::matched(
+                "Edit".to_string(),
+                shell_snippet("printf 'edit-post'"),
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        // when invoked with tool_name="Read", the Edit matcher should skip
+        let result = runner.run_post_tool_use("Read", r#"{"path":"x"}"#, "content", false);
+        assert!(result.messages().is_empty());
+
+        // when invoked with tool_name="Edit", the hook runs
+        let result =
+            runner.run_post_tool_use("Edit", r#"{"file":"x.rs"}"#, "ok", false);
+        assert_eq!(result.messages(), &["edit-post".to_string()]);
     }
 
     #[cfg(windows)]
