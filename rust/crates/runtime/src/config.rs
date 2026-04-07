@@ -274,6 +274,25 @@ impl ConfigLoader {
             || PathBuf::from(".mcp.json"),
             |parent| parent.join(".mcp.json"),
         );
+        // Detect whether running as Claw (config home is ~/.claw/) to use
+        // separate MCP config files that don't collide with Claude Code.
+        let is_claw = self
+            .config_home
+            .file_name()
+            .map_or(false, |name| name == ".claw");
+        let project_mcp_filename = if is_claw {
+            ".claw.mcp.json"
+        } else {
+            ".mcp.json"
+        };
+        let global_mcp_path = if is_claw {
+            self.config_home.parent().map_or_else(
+                || PathBuf::from(".claw.mcp.json"),
+                |parent| parent.join(".claw.mcp.json"),
+            )
+        } else {
+            user_mcp_path
+        };
         vec![
             ConfigEntry {
                 source: ConfigSource::User,
@@ -283,10 +302,10 @@ impl ConfigLoader {
                 source: ConfigSource::User,
                 path: self.config_home.join("settings.json"),
             },
-            // Global .mcp.json (e.g. ~/.mcp.json)
+            // Global MCP config (e.g. ~/.mcp.json or ~/.claw.mcp.json)
             ConfigEntry {
                 source: ConfigSource::User,
-                path: user_mcp_path,
+                path: global_mcp_path,
             },
             ConfigEntry {
                 source: ConfigSource::Project,
@@ -296,10 +315,10 @@ impl ConfigLoader {
                 source: ConfigSource::Project,
                 path: self.cwd.join(".claude").join("settings.json"),
             },
-            // Project-root .mcp.json (Claude Code convention)
+            // Project-root MCP config (.mcp.json or .claw.mcp.json)
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".mcp.json"),
+                path: self.cwd.join(project_mcp_filename),
             },
             ConfigEntry {
                 source: ConfigSource::Local,
@@ -529,10 +548,11 @@ impl RuntimePluginConfig {
 #[must_use]
 /// Returns the default per-user config directory used by the runtime.
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("CLAUDE_CONFIG_HOME")
+    std::env::var_os("CLAW_CONFIG_HOME")
+        .or_else(|| std::env::var_os("CLAUDE_CONFIG_HOME"))
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
-        .unwrap_or_else(|| PathBuf::from(".claude"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
+        .unwrap_or_else(|| PathBuf::from(".claw"))
 }
 
 impl RuntimeHookConfig {

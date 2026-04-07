@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "claude"
+name = "claw"
 path = "src/main.rs"
 
 [dependencies]

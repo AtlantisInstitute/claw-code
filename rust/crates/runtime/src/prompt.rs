@@ -38,7 +38,7 @@ impl From<ConfigError> for PromptBuildError {
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 /// Human-readable default frontier model name embedded into generated prompts.
-pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
+pub const FRONTIER_MODEL_NAME: &str = "Grok 4.1 Fast Reasoning";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 /// Maximum byte size for a single rules file to prevent loading binary or
@@ -436,7 +436,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# Claude instructions".to_string()];
+    let mut sections = vec!["# Claw instructions".to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -563,7 +563,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
-            "No Claude Code settings files loaded.".to_string()
+            "No Claw Code settings files loaded.".to_string()
         ]));
         return lines.join("\n");
     }

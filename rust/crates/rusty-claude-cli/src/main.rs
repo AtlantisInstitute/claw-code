@@ -55,7 +55,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "grok-4-1-fast-reasoning";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -102,13 +102,13 @@ type RuntimePluginStateBuildOutput = (
 fn main() {
     if let Err(error) = run() {
         let message = error.to_string();
-        if message.contains("`claude --help`") {
+        if message.contains("`claw --help`") {
             eprintln!("error: {message}");
         } else {
             eprintln!(
                 "error: {message}
 
-Run `claude --help` for usage."
+Run `claw --help` for usage."
             );
         }
         std::process::exit(1);
@@ -1712,7 +1712,7 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
             .build_url();
 
     if output_format == CliOutputFormat::Text {
-        println!("Starting Claude OAuth login...");
+        println!("Starting Claw OAuth login...");
         println!("Listening for callback on {redirect_uri}");
     }
     if let Err(error) = open_browser(&authorize_url) {
@@ -1759,14 +1759,14 @@ fn run_login(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::E
         scopes: token_set.scopes,
     })?;
     match output_format {
-        CliOutputFormat::Text => println!("Claude OAuth login complete."),
+        CliOutputFormat::Text => println!("Claw OAuth login complete."),
         CliOutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "kind": "login",
                 "callback_port": callback_port,
                 "redirect_uri": redirect_uri,
-                "message": "Claude OAuth login complete.",
+                "message": "Claw OAuth login complete.",
             }))?
         ),
     }
@@ -1793,12 +1793,12 @@ fn emit_login_browser_open_failure(
 fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     clear_oauth_credentials()?;
     match output_format {
-        CliOutputFormat::Text => println!("Claude OAuth credentials cleared."),
+        CliOutputFormat::Text => println!("Claw OAuth credentials cleared."),
         CliOutputFormat::Json => println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "kind": "logout",
-                "message": "Claude OAuth credentials cleared.",
+                "message": "Claw OAuth credentials cleared.",
             }))?
         ),
     }
@@ -1846,9 +1846,9 @@ fn wait_for_oauth_callback(
     let callback = parse_oauth_callback_request_target(target)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let body = if callback.error.is_some() {
-        "Claude OAuth login failed. You can close this window."
+        "Claw OAuth login failed. You can close this window."
     } else {
-        "Claude OAuth login succeeded. You can close this window."
+        "Claw OAuth login succeeded. You can close this window."
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -5064,7 +5064,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claude Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -5736,7 +5736,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: api::ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -5756,11 +5756,14 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let client = api::ProviderClient::from_model_with_anthropic_auth(
+            &model,
+            resolve_cli_auth_source().ok(),
+        )?
+        .with_prompt_cache(PromptCache::new(session_id));
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -6721,7 +6724,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &api::ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -6928,60 +6931,60 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 
 #[allow(clippy::too_many_lines)]
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claude v{VERSION}")?;
+    writeln!(out, "claw v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claude [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claude [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claude [--model MODEL] [--output-format text|json] TEXT"
+        "  claw [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
         out,
-        "  claude --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
+        "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
-    writeln!(out, "  claude help")?;
+    writeln!(out, "  claw help")?;
     writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  claude version")?;
+    writeln!(out, "  claw version")?;
     writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  claude status")?;
+    writeln!(out, "  claw status")?;
     writeln!(
         out,
         "      Show the current local workspace status snapshot"
     )?;
-    writeln!(out, "  claude sandbox")?;
+    writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claude doctor")?;
+    writeln!(out, "  claw doctor")?;
     writeln!(
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  claude dump-manifests")?;
-    writeln!(out, "  claude bootstrap-plan")?;
-    writeln!(out, "  claude agents")?;
-    writeln!(out, "  claude mcp")?;
-    writeln!(out, "  claude skills")?;
+    writeln!(out, "  claw dump-manifests")?;
+    writeln!(out, "  claw bootstrap-plan")?;
+    writeln!(out, "  claw agents")?;
+    writeln!(out, "  claw mcp")?;
+    writeln!(out, "  claw skills")?;
     writeln!(
         out,
-        "  claude system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
+        "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
     )?;
-    writeln!(out, "  claude login")?;
-    writeln!(out, "  claude logout")?;
-    writeln!(out, "  claude init")?;
+    writeln!(out, "  claw login")?;
+    writeln!(out, "  claw logout")?;
+    writeln!(out, "  claw init")?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
     writeln!(
@@ -7031,7 +7034,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .claude/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  REPL turns auto-save to .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
     )?;
     writeln!(
         out,
@@ -7042,26 +7045,26 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  claude --model claude-opus \"summarize this repo\"")?;
+    writeln!(out, "  claw --model grok-4-1-fast-reasoning \"summarize this repo\"")?;
     writeln!(
         out,
-        "  claude --output-format json prompt \"explain src/main.rs\""
+        "  claw --output-format json prompt \"explain src/main.rs\""
     )?;
     writeln!(
         out,
-        "  claude --allowedTools read,glob \"summarize Cargo.toml\""
+        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
-    writeln!(out, "  claude --resume {LATEST_SESSION_REFERENCE}")?;
+    writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
     writeln!(
         out,
-        "  claude --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
+        "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
-    writeln!(out, "  claude agents")?;
-    writeln!(out, "  claude mcp show my-server")?;
-    writeln!(out, "  claude /skills")?;
-    writeln!(out, "  claude doctor")?;
-    writeln!(out, "  claude login")?;
-    writeln!(out, "  claude init")?;
+    writeln!(out, "  claw agents")?;
+    writeln!(out, "  claw mcp show my-server")?;
+    writeln!(out, "  claw /skills")?;
+    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  claw login")?;
+    writeln!(out, "  claw init")?;
     Ok(())
 }
 
