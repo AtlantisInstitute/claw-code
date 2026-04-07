@@ -615,7 +615,6 @@ fn get_simple_doing_tasks_section() -> String {
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
-        format!("When creating git commits, always end the commit message with:\nCo-Authored-By: Grok <noreply@x.ai>"),
     ]);
 
     std::iter::once("# Doing tasks".to_string())

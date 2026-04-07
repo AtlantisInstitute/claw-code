@@ -4633,16 +4633,21 @@ impl LiveCli {
         validate_no_args("/commit", args)?;
         let status = git_output(&["status", "--short", "--branch"])?;
         let summary = parse_git_workspace_summary(Some(&status));
-        let branch = parse_git_status_branch(Some(&status));
         if summary.is_clean() {
             println!("{}", format_commit_skipped_report());
             return Ok(());
         }
 
-        println!(
-            "{}",
-            format_commit_preflight_report(branch.as_deref(), summary)
-        );
+        let prompt = "Create a git commit for the current changes. Follow these steps:\n\
+            1. Run `git status` and `git diff --cached` and `git diff` to understand all staged and unstaged changes\n\
+            2. Stage appropriate files with `git add <specific-files>` (do NOT use `git add -A` or `git add .`)\n\
+            3. Draft a concise, descriptive commit message that summarizes the changes (focus on the \"why\" not the \"what\")\n\
+            4. Run `git commit -m \"<message>\"` with the drafted message\n\
+            5. Do NOT include any Co-Authored-By or attribution lines in the commit message\n\
+            6. Run `git status` after committing to confirm success"
+            .to_string();
+
+        self.run_turn(&prompt)?;
         Ok(())
     }
 
